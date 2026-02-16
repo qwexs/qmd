@@ -1,0 +1,284 @@
+/**
+ * jina-llm.ts - Jina AI API backend for QMD
+ *
+ * Alternative LLM provider using Jina AI cloud APIs for embeddings and reranking.
+ * Designed for Docker containers without GPU access.
+ *
+ * Environment variables:
+ *   JINA_API_KEY        - Required. Jina AI API key.
+ *   JINA_PROXY_URL      - Optional. HTTP proxy URL (uses undici ProxyAgent).
+ *   JINA_EMBED_MODEL    - Optional. Embedding model (default: jina-embeddings-v3).
+ *   JINA_RERANK_MODEL   - Optional. Rerank model (default: jina-reranker-v2-base-multilingual).
+ *   JINA_EMBED_DIMENSIONS - Optional. Embedding dimensions (default: 1024).
+ */
+
+import type {
+  LLM,
+  EmbedOptions,
+  EmbeddingResult,
+  GenerateOptions,
+  GenerateResult,
+  ModelInfo,
+  Queryable,
+  RerankDocument,
+  RerankOptions,
+  RerankResult,
+  RerankDocumentResult,
+} from "./llm";
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const JINA_API_BASE = "https://api.jina.ai/v1";
+const DEFAULT_EMBED_MODEL = "jina-embeddings-v3";
+const DEFAULT_RERANK_MODEL = "jina-reranker-v2-base-multilingual";
+const DEFAULT_EMBED_DIMENSIONS = 1024;
+const MAX_BATCH_SIZE = 100;
+
+// =============================================================================
+// Proxy support
+// =============================================================================
+
+type FetchFn = typeof globalThis.fetch;
+
+async function createFetchFn(): Promise<FetchFn> {
+  const proxyUrl = process.env.JINA_PROXY_URL;
+  if (!proxyUrl) return globalThis.fetch;
+
+  try {
+    const { ProxyAgent } = await import("undici");
+    const agent = new ProxyAgent(proxyUrl);
+    return (input: RequestInfo | URL, init?: RequestInit) => {
+      return globalThis.fetch(input, { ...init, dispatcher: agent } as any);
+    };
+  } catch {
+    console.warn("undici not available for proxy support, using direct fetch");
+    return globalThis.fetch;
+  }
+}
+
+// =============================================================================
+// JinaLLM Implementation
+// =============================================================================
+
+export class JinaLLM implements LLM {
+  private apiKey: string;
+  private embedModel: string;
+  private rerankModel: string;
+  private embedDimensions: number;
+  private fetchFn: FetchFn | null = null;
+
+  constructor() {
+    const apiKey = process.env.JINA_API_KEY;
+    if (!apiKey) {
+      throw new Error("JINA_API_KEY environment variable is required");
+    }
+    this.apiKey = apiKey;
+    this.embedModel = process.env.JINA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.rerankModel = process.env.JINA_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+    this.embedDimensions = parseInt(process.env.JINA_EMBED_DIMENSIONS || "", 10) || DEFAULT_EMBED_DIMENSIONS;
+  }
+
+  private async getFetch(): Promise<FetchFn> {
+    if (!this.fetchFn) {
+      this.fetchFn = await createFetchFn();
+    }
+    return this.fetchFn;
+  }
+
+  private async request<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {
+    const fetch = await this.getFetch();
+    const resp = await fetch(`${JINA_API_BASE}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`Jina API error ${resp.status}: ${text}`);
+    }
+
+    return resp.json() as Promise<T>;
+  }
+
+  // ==========================================================================
+  // Embeddings
+  // ==========================================================================
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    try {
+      const results = await this.embedTexts([text]);
+      return results[0];
+    } catch (error) {
+      console.error("Jina embedding error:", error);
+      return null;
+    }
+  }
+
+  /**
+   * Batch embed multiple texts. Splits into chunks of MAX_BATCH_SIZE.
+   * Falls back to individual requests on batch failure.
+   */
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+
+    for (let i = 0; i < texts.length; i += MAX_BATCH_SIZE) {
+      const batch = texts.slice(i, i + MAX_BATCH_SIZE);
+      try {
+        const batchResults = await this.embedTexts(batch);
+        for (let j = 0; j < batchResults.length; j++) {
+          results[i + j] = batchResults[j];
+        }
+      } catch (error) {
+        console.warn(`Jina batch embed failed, falling back to individual requests:`, error);
+        // Fallback: embed one by one
+        for (let j = 0; j < batch.length; j++) {
+          try {
+            const single = await this.embedTexts([batch[j]]);
+            results[i + j] = single[0];
+          } catch (innerError) {
+            console.error(`Jina embed failed for text ${i + j}:`, innerError);
+            results[i + j] = null;
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
+  private async embedTexts(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    type JinaEmbedResponse = {
+      data: Array<{ embedding: number[]; index: number }>;
+      model: string;
+    };
+
+    const resp = await this.request<JinaEmbedResponse>("/embeddings", {
+      model: this.embedModel,
+      task: "text-matching",
+      dimensions: this.embedDimensions,
+      input: texts,
+    });
+
+    // Sort by index to maintain order
+    const sorted = resp.data.sort((a, b) => a.index - b.index);
+    return sorted.map((item) => ({
+      embedding: item.embedding,
+      model: resp.model,
+    }));
+  }
+
+  // ==========================================================================
+  // Reranking
+  // ==========================================================================
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    type JinaRerankResponse = {
+      results: Array<{ index: number; relevance_score: number }>;
+      model: string;
+    };
+
+    const docTexts = documents.map((d) => d.text);
+
+    const resp = await this.request<JinaRerankResponse>("/rerank", {
+      model: this.rerankModel,
+      query,
+      documents: docTexts,
+      top_n: documents.length,
+    });
+
+    const results: RerankDocumentResult[] = resp.results.map((r) => ({
+      file: documents[r.index].file,
+      score: r.relevance_score,
+      index: r.index,
+    }));
+
+    // Sort by score descending (highest relevance first)
+    results.sort((a, b) => b.score - a.score);
+
+    return {
+      results,
+      model: resp.model,
+    };
+  }
+
+  // ==========================================================================
+  // Generation (not supported by Jina)
+  // ==========================================================================
+
+  async generate(_prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
+    return null;
+  }
+
+  // ==========================================================================
+  // Query Expansion (fallback without LLM)
+  // ==========================================================================
+
+  async expandQuery(
+    query: string,
+    options?: { context?: string; includeLexical?: boolean }
+  ): Promise<Queryable[]> {
+    const results: Queryable[] = [
+      { type: "vec", text: query },
+      { type: "lex", text: query },
+    ];
+    if (options?.includeLexical !== false) {
+      const lower = query.toLowerCase();
+      if (lower !== query) {
+        results.push({ type: "lex", text: lower });
+      }
+    }
+    return results;
+  }
+
+  // ==========================================================================
+  // Model info
+  // ==========================================================================
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    return { name: model, exists: true };
+  }
+
+  // ==========================================================================
+  // Tokenization (approximate, ~4 chars per token)
+  // ==========================================================================
+
+  async tokenize(text: string): Promise<readonly number[]> {
+    const count = Math.ceil(text.length / 4);
+    return Array.from({ length: count }, (_, i) => i);
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return Math.ceil(text.length / 4);
+  }
+
+  async detokenize(_tokens: readonly number[]): Promise<string> {
+    return "";
+  }
+
+  // ==========================================================================
+  // Lifecycle
+  // ==========================================================================
+
+  async dispose(): Promise<void> {
+    // No local resources to clean up
+  }
+
+  /**
+   * No-op for API-based provider. Compatible with LlamaCpp idle resource management.
+   */
+  async unloadIdleResources(): Promise<void> {
+    // Nothing to unload
+  }
+}

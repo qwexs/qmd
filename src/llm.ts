@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
  * Uses nomic-style task prefix format for embeddinggemma.
  */
 export function formatQueryForEmbedding(query: string): string {
+  if (process.env.QMD_LLM_PROVIDER === 'jina' || process.env.QMD_LLM_PROVIDER === 'openai') return query;
   return `task: search result | query: ${query}`;
 }
 
@@ -36,6 +37,7 @@ export function formatQueryForEmbedding(query: string): string {
  * Uses nomic-style format with title and text fields.
  */
 export function formatDocForEmbedding(text: string, title?: string): string {
+  if (process.env.QMD_LLM_PROVIDER === 'jina' || process.env.QMD_LLM_PROVIDER === 'openai') return text;
   return `title: ${title || "none"} | text: ${text}`;
 }
 
@@ -1373,6 +1375,22 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  * Get the default LlamaCpp instance (creates one if needed)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
+  if (process.env.QMD_LLM_PROVIDER === 'jina') {
+    if (!defaultLlamaCpp) {
+      // Dynamic import would be async; use require-style for sync singleton.
+      // JinaLLM implements the same LLM interface, cast to LlamaCpp for compatibility.
+      const { JinaLLM } = require("./jina-llm") as { JinaLLM: new () => LLM };
+      defaultLlamaCpp = new JinaLLM() as unknown as LlamaCpp;
+    }
+    return defaultLlamaCpp;
+  }
+  if (process.env.QMD_LLM_PROVIDER === 'openai') {
+    if (!defaultLlamaCpp) {
+      const { OpenAILLM } = require("./openai-llm") as { OpenAILLM: new () => LLM };
+      defaultLlamaCpp = new OpenAILLM() as unknown as LlamaCpp;
+    }
+    return defaultLlamaCpp;
+  }
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
   }

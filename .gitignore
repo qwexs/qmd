@@ -2,6 +2,9 @@ node_modules/
 dist/
 .npmrc
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
 .DS_Store
 archive/
 texts/

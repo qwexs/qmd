@@ -16,6 +16,9 @@ npm install -g @tobilu/qmd
 # or
 bun install -g @tobilu/qmd
 
+# Or install from this fork (includes OpenAI & Jina cloud providers)
+bun install -g https://github.com/qwexs/qmd
+
 # Or run directly
 npx @tobilu/qmd ...
 bunx @tobilu/qmd ...
@@ -53,6 +56,40 @@ qmd search "API" -c notes
 # Export all matches for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
+
+### Cloud Providers (no local GPU required)
+
+By default, QMD runs all models locally via node-llama-cpp (requires GPU or fast CPU). You can switch to cloud APIs instead:
+
+**OpenAI:**
+
+```sh
+export QMD_LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-proj-xxx
+
+# Optional: customize models
+export OPENAI_EMBED_MODEL=text-embedding-3-small    # default
+export OPENAI_GENERATE_MODEL=gpt-4o-mini            # default (query expansion)
+
+# Optional: use OpenAI-compatible providers (Azure, vLLM, LiteLLM, etc.)
+export OPENAI_BASE_URL=https://your-provider.com/v1
+```
+
+**Jina AI:**
+
+```sh
+export QMD_LLM_PROVIDER=jina
+export JINA_API_KEY=jina_xxxxxxxxxxxx
+
+# Optional: customize models
+export JINA_EMBED_MODEL=jina-embeddings-v3                      # default
+export JINA_RERANK_MODEL=jina-reranker-v2-base-multilingual     # default
+export JINA_EMBED_DIMENSIONS=1024                               # default
+```
+
+> Without `QMD_LLM_PROVIDER`, QMD downloads ~2GB of GGUF models on first run and uses them locally. Set the variable to skip local models entirely.
+>
+> See [Environment Variables](#environment-variables) for the full reference.
 
 ### Using with AI Agents
 
@@ -97,7 +134,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude marketplace add tobi/qmd
+claude marketplace add qwexs/qmd
 claude plugin add qmd@qmd
 ```
 
@@ -264,12 +301,15 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 npm install -g @tobilu/qmd
 # or
 bun install -g @tobilu/qmd
+
+# Or install from this fork (includes OpenAI & Jina cloud providers)
+bun install -g github:qwexs/qmd
 ```
 
 ### Development
 
 ```sh
-git clone https://github.com/tobi/qmd
+git clone https://github.com/qwexs/qmd
 cd qmd
 npm install
 npm link
@@ -487,9 +527,48 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ## Environment Variables
 
+### General
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina` or `openai`. When unset, QMD uses local GGUF models via node-llama-cpp |
+
+### Jina AI Provider (`QMD_LLM_PROVIDER=jina`)
+
+Use [Jina AI](https://jina.ai/) cloud APIs for embeddings and reranking. Query expansion is skipped (not supported by Jina).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JINA_API_KEY` | — | **Required.** Jina AI API key |
+| `JINA_EMBED_MODEL` | `jina-embeddings-v3` | Embedding model |
+| `JINA_RERANK_MODEL` | `jina-reranker-v2-base-multilingual` | Rerank model |
+| `JINA_EMBED_DIMENSIONS` | `1024` | Embedding vector dimensions |
+| `JINA_PROXY_URL` | — | HTTP proxy URL |
+
+```sh
+export QMD_LLM_PROVIDER=jina
+export JINA_API_KEY=jina_xxxxxxxxxxxx
+```
+
+### OpenAI Provider (`QMD_LLM_PROVIDER=openai`)
+
+Use OpenAI-compatible APIs for embeddings and generation (query expansion). Reranking uses cosine similarity instead of a cross-encoder. Query expansion is skipped.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | — | **Required.** OpenAI API key |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL (change for OpenAI-compatible providers) |
+| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
+| `OPENAI_GENERATE_MODEL` | `gpt-4o-mini` | Generation model (for query expansion) |
+| `OPENAI_PROXY_URL` | — | HTTP proxy URL |
+
+```sh
+export QMD_LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-proj-xxxxxxxxxxxx
+```
+
+> **Tip:** Set `OPENAI_BASE_URL` to use any OpenAI-compatible API (e.g., Azure OpenAI, local vLLM, LiteLLM).
 
 ## How It Works
 
