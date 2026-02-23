@@ -504,20 +504,23 @@ export class LlamaCpp implements LLM {
       // (likely a binary/build config issue in node-llama-cpp).
       // @ts-expect-error node-llama-cpp API compat
       const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      // Prefer Metal > Vulkan > CUDA > CPU
+      // Vulkan is preferred over CUDA to avoid false-positive CUDA detection on AMD GPUs.
+      // Each backend is tried in order; on failure we fall through to the next.
+      const gpuOrder = (["metal", "vulkan", "cuda"] as const).filter(g => gpuTypes.includes(g));
 
-      let llama: Llama;
-      if (preferred) {
+      let llama: Llama | undefined;
+      for (const gpu of gpuOrder) {
         try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          llama = await getLlama({ gpu, logLevel: LlamaLogLevel.error });
+          break;
         } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
           process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            `QMD Warning: ${gpu} reported available but failed to initialize. Trying next...\n`
           );
         }
-      } else {
+      }
+      if (!llama) {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
       }
 

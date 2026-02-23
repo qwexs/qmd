@@ -2893,7 +2893,11 @@ if (isMain) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
+    try {
+      await disposeDefaultLlamaCpp();
+    } catch {
+      // Ignore cleanup errors — known issue with node-llama-cpp + Bun exit handling
+    }
     process.exit(0);
   }
 
