@@ -12,6 +12,11 @@
   the local instance. See README for the full env-var reference
   (`OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL`,
   `OLLAMA_EMBED_DIMENSIONS`, `OLLAMA_PROXY_URL`).
+- `qmd embed --timeout <minutes>` overrides the embed session's max duration
+  (previously hardcoded to 30 minutes). Use a larger value to let a big index
+  finish in one run, or `--timeout 0` to remove the cap entirely. When the cap is
+  reached, remaining document batches are skipped as before, so re-running
+  `qmd embed` continues where it left off.
 
 ### Documentation
 
