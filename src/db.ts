@@ -67,13 +67,21 @@ if (isBun) {
  * `bun:sqlite` and `better-sqlite3` both default `busy_timeout` to 0, so
  * concurrent writers throw `SQLITE_BUSY` instead of waiting. WAL improves
  * read-while-write concurrency but does not serialise writers. Setting the
- * timeout at connection open makes parallel processes (e.g. `qmd query`
- * fan-out) wait for the write lock through `initializeDatabase`'s DDL
- * instead of racing it. See https://bun.sh/docs/api/sqlite#busy-timeout.
+ * timeout at connection open makes parallel processes (e.g. an `update` or
+ * `query` racing a long `embed`, or a first-open schema migration racing any
+ * routine command) queue at batch boundaries instead of failing on contact.
+ *
+ * Default 120_000 ms outlasts the worst-case batch commit on a multi-GB
+ * index. Override with `QMD_SQLITE_BUSY_TIMEOUT` (value in milliseconds; `0`
+ * restores the upstream fail-fast behaviour). See
+ * https://bun.sh/docs/api/sqlite#busy-timeout.
  */
 export function openDatabase(path: string): Database {
   const db = new _Database(path) as Database;
-  db.exec("PRAGMA busy_timeout = 5000");
+  const raw = process.env.QMD_SQLITE_BUSY_TIMEOUT;
+  const parsed = raw !== undefined && raw !== "" ? Number(raw) : Number.NaN;
+  const busyTimeoutMs = Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 120_000;
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   return db;
 }
 
