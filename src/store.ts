@@ -838,36 +838,26 @@ function rebuildFTSForCjkNormalization(db: Database): void {
     flushBatch();
   }
 
-  // Atomic swap: only once the shadow table is fully populated do we drop the
-  // live index and rename the rebuild table into its place. FTS5 virtual
-  // tables support ALTER TABLE ... RENAME in modern SQLite. The swap + version
-  // bump happen in a single transaction so the version marker is never set
-  // without a complete index.
-  //
-  // legacy_alter_table=ON is required for the duration of the RENAME: the
-  // documents_ai/documents_au triggers reference `documents_fts` by name, and
-  // since SQLite 3.25 ALTER TABLE ... RENAME re-validates every trigger/view
-  // body against the schema mid-rename. With the live `documents_fts` already
-  // dropped, that re-validation aborts with "no such table: documents_fts"
-  // before the rename completes. The legacy pragma restores the pre-3.25
-  // behavior (rename the object only, don't rewrite/re-check dependent trigger
-  // bodies); the triggers then resolve correctly against the renamed table. It
-  // is a connection-level PRAGMA and cannot be toggled inside an open
-  // transaction, so it is set immediately before and reset immediately after.
-  db.exec(`PRAGMA legacy_alter_table = ON`);
-  try {
-    const swap = db.transaction(() => {
-      db.exec(`DROP TABLE IF EXISTS documents_fts`);
-      db.exec(`ALTER TABLE documents_fts_rebuild RENAME TO documents_fts`);
-      db.prepare(`
-        INSERT OR REPLACE INTO store_config(key, value)
-        VALUES ('fts_cjk_normalized_version', ?)
-      `).run(FTS_CJK_NORMALIZED_VERSION);
-    });
-    swap();
-  } finally {
-    db.exec(`PRAGMA legacy_alter_table = OFF`);
-  }
+  // Atomic swap: copy the completed shadow index into the live table and drop
+  // the shadow. Using INSERT INTO … SELECT + DROP avoids ALTER TABLE … RENAME,
+  // which on SQLite ≥ 3.25 re-validates every trigger body that references the
+  // renamed table — the documents_ai/documents_au triggers reference
+  // documents_fts by name, so renaming after a DROP fails with
+  // "no such table: main.documents_fts". The copy+drop path leaves the live
+  // table and its triggers untouched until the transaction commits.
+  const swap = db.transaction(() => {
+    db.exec(`DELETE FROM documents_fts`);
+    db.exec(
+      `INSERT INTO documents_fts(rowid, filepath, title, body)
+       SELECT rowid, filepath, title, body FROM documents_fts_rebuild`
+    );
+    db.exec(`DROP TABLE documents_fts_rebuild`);
+    db.prepare(`
+      INSERT OR REPLACE INTO store_config(key, value)
+      VALUES ('fts_cjk_normalized_version', ?)
+    `).run(FTS_CJK_NORMALIZED_VERSION);
+  });
+  swap();
 }
 
 function initializeDatabase(db: Database): void {

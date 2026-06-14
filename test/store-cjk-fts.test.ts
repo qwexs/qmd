@@ -167,9 +167,11 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     // It must NOT pull the whole result set (every document body) into a JS
     // array — that is the OOM regression this fix removes.
     expect(fnBody).not.toMatch(/\.all\(/);
-    // Sanity: it builds into a shadow table and atomically swaps it in.
+    // Sanity: it builds into a shadow table and atomically swaps it in via
+    // INSERT INTO … SELECT (not ALTER TABLE … RENAME, which triggers SQLite
+    // 3.25+ re-validation of dependent trigger bodies).
     expect(fnBody).toContain("documents_fts_rebuild");
-    expect(fnBody).toContain("RENAME TO documents_fts");
+    expect(fnBody).toContain("INSERT INTO documents_fts");
   });
 });
 
