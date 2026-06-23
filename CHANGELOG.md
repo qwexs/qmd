@@ -100,7 +100,16 @@
   and `better-sqlite3` both default the timeout to 0, so the loser
   previously failed on the first DDL statement in `initializeDatabase`.
   Override the default with `QMD_SQLITE_BUSY_TIMEOUT` (milliseconds; `0`
-  restores fail-fast).
+  restores fail-fast). Two more crashes on the same concurrent-open
+  path are fixed: `trigger documents_ai already exists` (the FTS sync
+  triggers were dropped and recreated as separate statements on every
+  open, so two processes interleaved between the `DROP` and the
+  `CREATE`; `busy_timeout` serialises individual statements but not the
+  pair) and `database is locked` while migrating a cold database to WAL
+  (the `journal_mode` switch needs a brief exclusive lock and does not
+  invoke the busy handler). FTS trigger setup is now gated behind
+  `PRAGMA user_version` inside one `IMMEDIATE` transaction, and the WAL
+  migration retries within the busy-timeout budget.
 
 ## [2.5.3] - 2026-05-28
 

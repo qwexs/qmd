@@ -756,6 +756,10 @@ const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\
 const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const FTS_CJK_NORMALIZED_VERSION = "1";
 
+// Bump when any FTS sync trigger body in applyFtsSyncTriggers changes, so the
+// new definition is reapplied to existing databases on next open.
+const STORE_SCHEMA_VERSION = 1;
+
 /**
  * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
  * Normalize CJK runs by spacing every character so exact CJK queries can be
@@ -861,6 +865,76 @@ function rebuildFTSForCjkNormalization(db: Database): void {
   swap();
 }
 
+function getUserVersion(db: Database): number {
+  const row = db.prepare(`PRAGMA user_version`).get() as Record<string, number> | undefined;
+  const value = row ? Object.values(row)[0] : 0;
+  return typeof value === "number" ? value : Number(value) || 0;
+}
+
+// FTS sync triggers keep documents_fts current for callers that write directly
+// to documents (production indexing rebuilds FTS in TypeScript to normalize CJK
+// first). The bodies use DROP+CREATE rather than CREATE IF NOT EXISTS so a
+// changed body propagates to existing databases. DROP and CREATE are separate
+// autocommit statements, so concurrent opens of one database interleave across
+// connections (A drops, B drops, A creates, B creates -> "trigger already
+// exists"); busy_timeout serializes individual statements but not the pair.
+// Gate the work behind PRAGMA user_version and apply it inside one IMMEDIATE
+// transaction: the DROP+CREATE pair is atomic across connections, and a
+// double-checked read skips it once any process has stamped the version.
+function applyFtsSyncTriggers(db: Database): void {
+  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) return;
+  db.exec(`BEGIN IMMEDIATE`);
+  try {
+    if (getUserVersion(db) < STORE_SCHEMA_VERSION) {
+      db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+      db.exec(`
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents
+        WHEN new.active = 1
+        BEGIN
+          INSERT INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+      db.exec(`
+        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+        END
+      `);
+
+      db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+      db.exec(`
+        CREATE TRIGGER documents_au AFTER UPDATE ON documents
+        BEGIN
+          -- Delete from FTS if no longer active
+          DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+          -- Update FTS if still/newly active
+          INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END
+      `);
+
+      db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
+    }
+    db.exec(`COMMIT`);
+  } catch (err) {
+    db.exec(`ROLLBACK`);
+    throw err;
+  }
+}
+
 function initializeDatabase(db: Database): void {
   try {
     loadSqliteVec(db);
@@ -873,7 +947,6 @@ function initializeDatabase(db: Database): void {
     _sqliteVecUnavailableReason = getErrorMessage(err);
     console.warn(_sqliteVecUnavailableReason);
   }
-  db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -963,48 +1036,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers keep FTS in sync for callers that write directly to documents.
-  // Production indexing paths rebuild entries in TypeScript so CJK text can be
-  // normalized before it reaches the unicode61 tokenizer.
-  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
-  db.exec(`
-    CREATE TRIGGER documents_ai AFTER INSERT ON documents
-    WHEN new.active = 1
-    BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
-  db.exec(`
-    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-      DELETE FROM documents_fts WHERE rowid = old.id;
-    END
-  `);
-
-  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
-  db.exec(`
-    CREATE TRIGGER documents_au AFTER UPDATE ON documents
-    BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
+  applyFtsSyncTriggers(db);
 
   rebuildFTSForCjkNormalization(db);
 }
