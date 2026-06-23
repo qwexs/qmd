@@ -1,15 +1,20 @@
 /**
  * jina-llm.ts - Jina AI API backend for QMD
  *
- * Alternative LLM provider using Jina AI cloud APIs for embeddings and reranking.
- * Designed for Docker containers without GPU access.
+ * Cloud LLM provider using Jina AI cloud APIs for embeddings and reranking.
+ * Designed for environments without local GPU access (CI, containers).
  *
  * Environment variables:
- *   JINA_API_KEY        - Required. Jina AI API key.
- *   JINA_PROXY_URL      - Optional. HTTP proxy URL (uses undici ProxyAgent).
- *   JINA_EMBED_MODEL    - Optional. Embedding model (default: jina-embeddings-v3).
- *   JINA_RERANK_MODEL   - Optional. Rerank model (default: jina-reranker-v2-base-multilingual).
+ *   JINA_API_KEY          - Required. Jina AI API key.
+ *   JINA_PROXY_URL        - Optional. HTTP proxy URL (uses undici ProxyAgent).
+ *   JINA_EMBED_MODEL      - Optional. Embedding model (default: jina-embeddings-v3).
+ *   JINA_RERANK_MODEL     - Optional. Rerank model (default: jina-reranker-v2-base-multilingual).
  *   JINA_EMBED_DIMENSIONS - Optional. Embedding dimensions (default: 1024).
+ *
+ * Implements the v2.5.3 LLM interface plus the additional public surface
+ * that store.ts expects on the singleton returned by getDefaultLlamaCpp()
+ * (embedModelName / generateModelName / rerankModelName getters, plus
+ * tokenize / detokenize / countTokens / embedBatch / getDeviceInfo).
  */
 
 import type {
@@ -24,7 +29,7 @@ import type {
   RerankOptions,
   RerankResult,
   RerankDocumentResult,
-} from "./llm";
+} from "./llm.js";
 
 // =============================================================================
 // Configuration
@@ -35,22 +40,28 @@ const DEFAULT_EMBED_MODEL = "jina-embeddings-v3";
 const DEFAULT_RERANK_MODEL = "jina-reranker-v2-base-multilingual";
 const DEFAULT_EMBED_DIMENSIONS = 1024;
 const MAX_BATCH_SIZE = 100;
+const APPROX_CHARS_PER_TOKEN = 4;
 
 // =============================================================================
 // Proxy support
 // =============================================================================
 
-type FetchFn = typeof globalThis.fetch;
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchInit = Parameters<typeof fetch>[1];
+type FetchFn = (input: FetchInput, init?: FetchInit) => ReturnType<typeof fetch>;
 
+// undici is an optional runtime dep — only used when JINA_PROXY_URL is set.
+// We import it lazily and fall back to the global fetch if it is not installed.
 async function createFetchFn(): Promise<FetchFn> {
   const proxyUrl = process.env.JINA_PROXY_URL;
   if (!proxyUrl) return globalThis.fetch;
 
   try {
-    const { ProxyAgent } = await import("undici");
-    const agent = new ProxyAgent(proxyUrl);
-    return (input: RequestInfo | URL, init?: RequestInit) => {
-      return globalThis.fetch(input, { ...init, dispatcher: agent } as any);
+    // @ts-expect-error — undici is an optional dependency; only used when proxy URL is set
+    const undici = await import("undici");
+    const agent = new undici.ProxyAgent(proxyUrl);
+    return (input, init) => {
+      return undici.fetch(input, { ...(init ?? {}), dispatcher: agent });
     };
   } catch {
     console.warn("undici not available for proxy support, using direct fetch");
@@ -64,8 +75,8 @@ async function createFetchFn(): Promise<FetchFn> {
 
 export class JinaLLM implements LLM {
   private apiKey: string;
-  private embedModel: string;
-  private rerankModel: string;
+  private embedModelNameValue: string;
+  private rerankModelNameValue: string;
   private embedDimensions: number;
   private fetchFn: FetchFn | null = null;
 
@@ -75,9 +86,25 @@ export class JinaLLM implements LLM {
       throw new Error("JINA_API_KEY environment variable is required");
     }
     this.apiKey = apiKey;
-    this.embedModel = process.env.JINA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
-    this.rerankModel = process.env.JINA_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+    this.embedModelNameValue = process.env.JINA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.rerankModelNameValue = process.env.JINA_RERANK_MODEL || DEFAULT_RERANK_MODEL;
     this.embedDimensions = parseInt(process.env.JINA_EMBED_DIMENSIONS || "", 10) || DEFAULT_EMBED_DIMENSIONS;
+  }
+
+  // Public getters used by store.ts (mirrors LlamaCpp.embedModelName / etc.).
+  get embedModelName(): string {
+    return this.embedModelNameValue;
+  }
+
+  get generateModelName(): string {
+    // Jina does not offer a text-generation model; we reuse the rerank model
+    // name as a placeholder so callers that log it still get something
+    // meaningful. generate() always returns null for Jina.
+    return this.rerankModelNameValue;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelNameValue;
   }
 
   private async getFetch(): Promise<FetchFn> {
@@ -110,10 +137,10 @@ export class JinaLLM implements LLM {
   // Embeddings
   // ==========================================================================
 
-  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+  async embed(text: string, _options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     try {
       const results = await this.embedTexts([text]);
-      return results[0];
+      return results[0] ?? null;
     } catch (error) {
       console.error("Jina embedding error:", error);
       return null;
@@ -134,15 +161,14 @@ export class JinaLLM implements LLM {
       try {
         const batchResults = await this.embedTexts(batch);
         for (let j = 0; j < batchResults.length; j++) {
-          results[i + j] = batchResults[j];
+          results[i + j] = batchResults[j] ?? null;
         }
       } catch (error) {
         console.warn(`Jina batch embed failed, falling back to individual requests:`, error);
-        // Fallback: embed one by one
         for (let j = 0; j < batch.length; j++) {
           try {
-            const single = await this.embedTexts([batch[j]]);
-            results[i + j] = single[0];
+            const single = await this.embedTexts([batch[j]!]);
+            results[i + j] = single[0] ?? null;
           } catch (innerError) {
             console.error(`Jina embed failed for text ${i + j}:`, innerError);
             results[i + j] = null;
@@ -161,14 +187,13 @@ export class JinaLLM implements LLM {
     };
 
     const resp = await this.request<JinaEmbedResponse>("/embeddings", {
-      model: this.embedModel,
+      model: this.embedModelNameValue,
       task: "text-matching",
       dimensions: this.embedDimensions,
       input: texts,
     });
 
-    // Sort by index to maintain order
-    const sorted = resp.data.sort((a, b) => a.index - b.index);
+    const sorted = resp.data.slice().sort((a, b) => a.index - b.index);
     return sorted.map((item) => ({
       embedding: item.embedding,
       model: resp.model,
@@ -182,7 +207,7 @@ export class JinaLLM implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    options: RerankOptions = {}
+    _options: RerankOptions = {}
   ): Promise<RerankResult> {
     type JinaRerankResponse = {
       results: Array<{ index: number; relevance_score: number }>;
@@ -192,19 +217,18 @@ export class JinaLLM implements LLM {
     const docTexts = documents.map((d) => d.text);
 
     const resp = await this.request<JinaRerankResponse>("/rerank", {
-      model: this.rerankModel,
+      model: this.rerankModelNameValue,
       query,
       documents: docTexts,
       top_n: documents.length,
     });
 
     const results: RerankDocumentResult[] = resp.results.map((r) => ({
-      file: documents[r.index].file,
+      file: documents[r.index]!.file,
       score: r.relevance_score,
       index: r.index,
     }));
 
-    // Sort by score descending (highest relevance first)
     results.sort((a, b) => b.score - a.score);
 
     return {
@@ -246,25 +270,52 @@ export class JinaLLM implements LLM {
   // Model info
   // ==========================================================================
 
-  async modelExists(model: string): Promise<ModelInfo> {
-    return { name: model, exists: true };
+  async modelExists(_model: string): Promise<ModelInfo> {
+    return { name: this.embedModelNameValue, exists: true };
   }
 
   // ==========================================================================
   // Tokenization (approximate, ~4 chars per token)
   // ==========================================================================
+  //
+  // Cloud providers do not expose their tokenizers. The store uses
+  // tokenize/detokenize for input-size truncation before embed() and
+  // embedBatch(); approximating at 4 chars per token is good enough for
+  // the safety bounds used by store.ts.
 
   async tokenize(text: string): Promise<readonly number[]> {
-    const count = Math.ceil(text.length / 4);
+    const count = Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
     return Array.from({ length: count }, (_, i) => i);
   }
 
   async countTokens(text: string): Promise<number> {
-    return Math.ceil(text.length / 4);
+    return Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
   }
 
   async detokenize(_tokens: readonly number[]): Promise<string> {
     return "";
+  }
+
+  // ==========================================================================
+  // Device info (stub for qmd doctor)
+  // ==========================================================================
+
+  async getDeviceInfo(_options?: { allowBuild?: boolean }): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram: { total: number; free: number } | null;
+    cpuCores: number;
+    description: string;
+  }> {
+    return {
+      gpu: false,
+      gpuOffloading: false,
+      gpuDevices: [],
+      vram: null,
+      cpuCores: 0,
+      description: `Jina AI cloud provider (${JINA_API_BASE}, dim=${this.embedDimensions})`,
+    };
   }
 
   // ==========================================================================

@@ -1,8 +1,9 @@
 /**
  * openai-llm.ts - OpenAI API backend for QMD
  *
- * Alternative LLM provider using OpenAI-compatible APIs for embeddings and generation.
- * Reranking is implemented via cosine similarity of embeddings.
+ * Cloud LLM provider using OpenAI-compatible APIs for embeddings and
+ * generation. Reranking is implemented via cosine similarity over the
+ * embedding vectors.
  *
  * Environment variables:
  *   OPENAI_API_KEY          - Required. OpenAI API key.
@@ -10,6 +11,14 @@
  *   OPENAI_PROXY_URL        - Optional. HTTP proxy URL (uses undici ProxyAgent).
  *   OPENAI_EMBED_MODEL      - Optional. Embedding model (default: text-embedding-3-small).
  *   OPENAI_GENERATE_MODEL   - Optional. Generation model (default: gpt-4o-mini).
+ *
+ * Implements the v2.5.3 LLM interface plus the additional public surface
+ * that store.ts expects on the singleton returned by getDefaultLlamaCpp()
+ * (embedModelName / generateModelName / rerankModelName getters, plus
+ * tokenize / detokenize / countTokens / embedBatch / getDeviceInfo). The
+ * latter methods are not in the LLM interface — they are part of LlamaCpp's
+ * public surface. We add them so the same call sites work whether the
+ * singleton is a LlamaCpp or a cloud LLM.
  */
 
 import type {
@@ -24,7 +33,7 @@ import type {
   RerankOptions,
   RerankResult,
   RerankDocumentResult,
-} from "./llm";
+} from "./llm.js";
 
 // =============================================================================
 // Configuration
@@ -34,22 +43,28 @@ const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_EMBED_MODEL = "text-embedding-3-small";
 const DEFAULT_GENERATE_MODEL = "gpt-4o-mini";
 const MAX_BATCH_SIZE = 100;
+const APPROX_CHARS_PER_TOKEN = 4;
 
 // =============================================================================
 // Proxy support
 // =============================================================================
 
-type FetchFn = typeof globalThis.fetch;
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchInit = Parameters<typeof fetch>[1];
+type FetchFn = (input: FetchInput, init?: FetchInit) => ReturnType<typeof fetch>;
 
+// undici is an optional runtime dep — only used when OPENAI_PROXY_URL is set.
+// We import it lazily and fall back to the global fetch if it is not installed.
 async function createFetchFn(): Promise<FetchFn> {
   const proxyUrl = process.env.OPENAI_PROXY_URL;
   if (!proxyUrl) return globalThis.fetch;
 
   try {
-    const { ProxyAgent } = await import("undici");
-    const agent = new ProxyAgent(proxyUrl);
-    return (input: RequestInfo | URL, init?: RequestInit) => {
-      return globalThis.fetch(input, { ...init, dispatcher: agent } as any);
+    // @ts-expect-error — undici is an optional dependency; only used when proxy URL is set
+    const undici = await import("undici");
+    const agent = new undici.ProxyAgent(proxyUrl);
+    return (input, init) => {
+      return undici.fetch(input, { ...(init ?? {}), dispatcher: agent });
     };
   } catch {
     console.warn("undici not available for proxy support, using direct fetch");
@@ -64,9 +79,9 @@ async function createFetchFn(): Promise<FetchFn> {
 function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0, normA = 0, normB = 0;
   for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
+    dot += a[i]! * b[i]!;
+    normA += a[i]! * a[i]!;
+    normB += b[i]! * b[i]!;
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
@@ -78,8 +93,8 @@ function cosineSimilarity(a: number[], b: number[]): number {
 export class OpenAILLM implements LLM {
   private apiKey: string;
   private baseUrl: string;
-  private embedModel: string;
-  private generateModel: string;
+  private embedModelNameValue: string;
+  private generateModelNameValue: string;
   private fetchFn: FetchFn | null = null;
 
   constructor() {
@@ -89,8 +104,23 @@ export class OpenAILLM implements LLM {
     }
     this.apiKey = apiKey;
     this.baseUrl = process.env.OPENAI_BASE_URL || DEFAULT_BASE_URL;
-    this.embedModel = process.env.OPENAI_EMBED_MODEL || DEFAULT_EMBED_MODEL;
-    this.generateModel = process.env.OPENAI_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+    this.embedModelNameValue = process.env.OPENAI_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.generateModelNameValue = process.env.OPENAI_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+  }
+
+  // Public getters used by store.ts (mirrors LlamaCpp.embedModelName / etc.).
+  get embedModelName(): string {
+    return this.embedModelNameValue;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelNameValue;
+  }
+
+  get rerankModelName(): string {
+    // OpenAI has no native reranker — we reuse the embed model name since
+    // rerank() is implemented as cosine similarity over embeddings.
+    return this.embedModelNameValue;
   }
 
   private async getFetch(): Promise<FetchFn> {
@@ -123,10 +153,10 @@ export class OpenAILLM implements LLM {
   // Embeddings
   // ==========================================================================
 
-  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+  async embed(text: string, _options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     try {
       const results = await this.embedTexts([text]);
-      return results[0];
+      return results[0] ?? null;
     } catch (error) {
       console.error("OpenAI embedding error:", error);
       return null;
@@ -147,15 +177,14 @@ export class OpenAILLM implements LLM {
       try {
         const batchResults = await this.embedTexts(batch);
         for (let j = 0; j < batchResults.length; j++) {
-          results[i + j] = batchResults[j];
+          results[i + j] = batchResults[j] ?? null;
         }
       } catch (error) {
         console.warn(`OpenAI batch embed failed, falling back to individual requests:`, error);
-        // Fallback: embed one by one
         for (let j = 0; j < batch.length; j++) {
           try {
-            const single = await this.embedTexts([batch[j]]);
-            results[i + j] = single[0];
+            const single = await this.embedTexts([batch[j]!]);
+            results[i + j] = single[0] ?? null;
           } catch (innerError) {
             console.error(`OpenAI embed failed for text ${i + j}:`, innerError);
             results[i + j] = null;
@@ -171,16 +200,15 @@ export class OpenAILLM implements LLM {
     type OpenAIEmbedResponse = {
       data: Array<{ embedding: number[]; index: number }>;
       model: string;
-      usage: { total_tokens: number };
+      usage?: { total_tokens: number };
     };
 
     const resp = await this.request<OpenAIEmbedResponse>("/embeddings", {
-      model: this.embedModel,
+      model: this.embedModelNameValue,
       input: texts,
     });
 
-    // Sort by index to maintain order
-    const sorted = resp.data.sort((a, b) => a.index - b.index);
+    const sorted = resp.data.slice().sort((a, b) => a.index - b.index);
     return sorted.map((item) => ({
       embedding: item.embedding,
       model: resp.model,
@@ -194,9 +222,8 @@ export class OpenAILLM implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    options: RerankOptions = {}
+    _options: RerankOptions = {}
   ): Promise<RerankResult> {
-    // Embed query and all documents
     const allTexts = [query, ...documents.map((d) => d.text)];
     const embeddings = await this.embedTexts(allTexts);
 
@@ -215,12 +242,11 @@ export class OpenAILLM implements LLM {
       };
     });
 
-    // Sort by score descending (highest relevance first)
     results.sort((a, b) => b.score - a.score);
 
     return {
       results,
-      model: this.embedModel,
+      model: this.embedModelNameValue,
     };
   }
 
@@ -236,7 +262,7 @@ export class OpenAILLM implements LLM {
 
     try {
       const resp = await this.request<OpenAIChatResponse>("/chat/completions", {
-        model: this.generateModel,
+        model: this.generateModelNameValue,
         messages: [{ role: "user", content: prompt }],
         max_tokens: options?.maxTokens ?? 150,
         temperature: options?.temperature ?? 0.7,
@@ -269,7 +295,6 @@ Query: ${query}`;
 
     const result = await this.generate(prompt, { maxTokens: 150, temperature: 0.7 });
     if (!result?.text) {
-      // Fallback
       const fallback: Queryable[] = [
         { type: "vec", text: query },
         { type: "lex", text: query },
@@ -279,7 +304,7 @@ Query: ${query}`;
 
     const lines = result.text.trim().split("\n");
     const queryables: Queryable[] = lines
-      .map((line) => {
+      .map((line: string) => {
         const colonIdx = line.indexOf(":");
         if (colonIdx === -1) return null;
         const type = line.slice(0, colonIdx).trim();
@@ -288,14 +313,13 @@ Query: ${query}`;
         if (!text) return null;
         return { type: type as Queryable["type"], text };
       })
-      .filter((q): q is Queryable => q !== null);
+      .filter((q: Queryable | null): q is Queryable => q !== null);
 
     const includeLexical = options?.includeLexical ?? true;
     const filtered = includeLexical ? queryables : queryables.filter((q) => q.type !== "lex");
 
     if (filtered.length > 0) return filtered;
 
-    // Fallback
     const fallback: Queryable[] = [
       { type: "hyde", text: `Information about ${query}` },
       { type: "lex", text: query },
@@ -308,25 +332,61 @@ Query: ${query}`;
   // Model info
   // ==========================================================================
 
-  async modelExists(model: string): Promise<ModelInfo> {
-    return { name: model, exists: true };
+  async modelExists(_model: string): Promise<ModelInfo> {
+    // OpenAI does not expose a generic model-existence probe; assume
+    // configured models are reachable. The OpenAI API will surface auth
+    // or model-not-found errors on the first real request.
+    return { name: this.embedModelNameValue, exists: true };
   }
 
   // ==========================================================================
   // Tokenization (approximate, ~4 chars per token)
   // ==========================================================================
+  //
+  // Cloud providers do not expose their tokenizers. The store uses
+  // tokenize/detokenize for input-size truncation before embed() and
+  // embedBatch(); approximating at 4 chars per token is good enough for
+  // the safety bounds used by store.ts (it also caps on the model context
+  // size further down).
 
   async tokenize(text: string): Promise<readonly number[]> {
-    const count = Math.ceil(text.length / 4);
+    const count = Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
     return Array.from({ length: count }, (_, i) => i);
   }
 
   async countTokens(text: string): Promise<number> {
-    return Math.ceil(text.length / 4);
+    return Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
   }
 
   async detokenize(_tokens: readonly number[]): Promise<string> {
+    // Cloud tokenizers are not reversible from opaque integer IDs. Returning
+    // the empty string is safe because store.ts only uses detokenize as a
+    // fallback when tokenizer-based truncation is required; the upstream
+    // LlamaCpp.detokenize round-trips real text. For the cloud path the
+    // char-approximation path in tokenize() is what callers should use.
     return "";
+  }
+
+  // ==========================================================================
+  // Device info (stub for qmd doctor)
+  // ==========================================================================
+
+  async getDeviceInfo(_options?: { allowBuild?: boolean }): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram: { total: number; free: number } | null;
+    cpuCores: number;
+    description: string;
+  }> {
+    return {
+      gpu: false,
+      gpuOffloading: false,
+      gpuDevices: [],
+      vram: null,
+      cpuCores: 0,
+      description: `OpenAI cloud provider (${this.baseUrl})`,
+    };
   }
 
   // ==========================================================================

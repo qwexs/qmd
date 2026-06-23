@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
-import { JinaLLM } from "./jina-llm";
+import { JinaLLM } from "./jina-llm.js";
 
 // Save and restore env
 const originalEnv = { ...process.env };
