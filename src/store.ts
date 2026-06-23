@@ -15,40 +15,44 @@ import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { realpathSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+// Note: node:path resolve is not imported — we export our own cross-platform resolve()
+import fastGlob from "fast-glob";
+import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  withLLMSessionForLlm,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
-import {
-  findContextForPath as collectionsFindContextForPath,
-  addContext as collectionsAddContext,
-  removeContext as collectionsRemoveContext,
-  listAllContexts as collectionsListAllContexts,
-  getCollection,
-  listCollections as collectionsListCollections,
-  addCollection as collectionsAddCollection,
-  removeCollection as collectionsRemoveCollection,
-  renameCollection as collectionsRenameCollection,
-  setGlobalContext,
-  loadConfig as collectionsLoadConfig,
-  type NamedCollection,
+import type {
+  NamedCollection,
+  Collection,
+  CollectionConfig,
+  ContextMap,
 } from "./collections.js";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || "/tmp";
-export const DEFAULT_EMBED_MODEL = "embeddinggemma";
-export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
+export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
+export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
+export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
+export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+
+const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
+const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
+const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -60,6 +64,25 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 // Search window for finding optimal break points (in tokens, ~200 tokens)
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+
+export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+  const significant = [
+    `model:${model}`,
+    `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
+    `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
+    `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
+    `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+  ].join("\n");
+  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+}
+
+/**
+ * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * falls back to the global singleton.
+ */
+function getLlm(store: Store): LlamaCpp {
+  return store.llm ?? getDefaultLlamaCpp();
+}
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -218,6 +241,89 @@ export function findBestCutoff(
   return bestPos;
 }
 
+// =============================================================================
+// Chunk Strategy
+// =============================================================================
+
+export type ChunkStrategy = "auto" | "regex";
+
+/**
+ * Merge two sets of break points (e.g. regex + AST), keeping the highest
+ * score at each position. Result is sorted by position.
+ */
+export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[] {
+  const seen = new Map<number, BreakPoint>();
+  for (const bp of a) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  for (const bp of b) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+}
+
+/**
+ * Core chunk algorithm that operates on precomputed break points and code fences.
+ * This is the shared implementation used by both regex-only and AST-aware chunking.
+ */
+export function chunkDocumentWithBreakPoints(
+  content: string,
+  breakPoints: BreakPoint[],
+  codeFences: CodeFenceRegion[],
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS
+): { text: string; pos: number }[] {
+  if (content.length <= maxChars) {
+    return [{ text: content, pos: 0 }];
+  }
+
+  const chunks: { text: string; pos: number }[] = [];
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    const targetEndPos = Math.min(charPos + maxChars, content.length);
+    let endPos = targetEndPos;
+
+    if (endPos < content.length) {
+      const bestCutoff = findBestCutoff(
+        breakPoints,
+        targetEndPos,
+        windowChars,
+        0.7,
+        codeFences
+      );
+
+      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
+        endPos = bestCutoff;
+      }
+    }
+
+    if (endPos <= charPos) {
+      endPos = Math.min(charPos + maxChars, content.length);
+    }
+
+    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+
+    if (endPos >= content.length) {
+      break;
+    }
+    charPos = endPos - overlapChars;
+    const lastChunkPos = chunks.at(-1)!.pos;
+    if (charPos <= lastChunkPos) {
+      charPos = endPos;
+    }
+  }
+
+  return chunks;
+}
+
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
 export const STRONG_SIGNAL_MIN_SCORE = 0.85;
@@ -236,7 +342,9 @@ export const RERANK_CANDIDATE_LIMIT = 40;
  */
 export type ExpandedQuery = {
   type: 'lex' | 'vec' | 'hyde';
-  text: string;
+  query: string;
+  /** Optional line number for error reporting (CLI parser) */
+  line?: number;
 };
 
 // =============================================================================
@@ -244,7 +352,7 @@ export type ExpandedQuery = {
 // =============================================================================
 
 export function homedir(): string {
-  return HOME;
+  return qmdHomedir();
 }
 
 /**
@@ -264,7 +372,8 @@ export function isAbsolutePath(path: string): boolean {
   if (path.startsWith('/')) {
     // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
     // Requires path[2] === '/' to distinguish from Unix paths like /c or /cache
-    if (path.length >= 3 && path[2] === '/') {
+    // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
+    if (!isWSL() && path.length >= 3 && path[2] === '/') {
       const driveLetter = path[1];
       if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
         return true;
@@ -288,6 +397,14 @@ export function isAbsolutePath(path: string): boolean {
  */
 export function normalizePathSeparators(path: string): string {
   return path.replace(/\\/g, '/');
+}
+
+/**
+ * Detect if running inside WSL (Windows Subsystem for Linux).
+ * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths.
+ */
+function isWSL(): boolean {
+  return !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 }
 
 /**
@@ -342,8 +459,9 @@ export function resolve(...paths: string[]): string {
     if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
       windowsDrive = firstPath.slice(0, 2);
       result = firstPath.slice(2);
-    } else if (firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
+    } else if (!isWSL() && firstPath.startsWith('/') && firstPath.length >= 3 && firstPath[2] === '/') {
       // Git Bash style: /c/ -> C: (C-Z drives only, not A or B)
+      // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
       const driveLetter = firstPath[1];
       if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
         windowsDrive = driveLetter.toUpperCase() + ':';
@@ -374,8 +492,9 @@ export function resolve(...paths: string[]): string {
       if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
         windowsDrive = p.slice(0, 2);
         result = p.slice(2);
-      } else if (p.startsWith('/') && p.length >= 3 && p[2] === '/') {
+      } else if (!isWSL() && p.startsWith('/') && p.length >= 3 && p[2] === '/') {
         // Git Bash style (C-Z drives only, not A or B)
+        // Skipped on WSL where /c/ is a valid drvfs mount point, not a drive letter
         const driveLetter = p[1];
         if (driveLetter && /[c-zC-Z]/.test(driveLetter)) {
           windowsDrive = driveLetter.toUpperCase() + ':';
@@ -421,6 +540,11 @@ export function enableProductionMode(): void {
   _productionMode = true;
 }
 
+/** Reset production mode flag — only for testing. */
+export function _resetProductionModeForTesting(): void {
+  _productionMode = false;
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (process.env.INDEX_PATH) {
@@ -460,6 +584,7 @@ export function getRealPath(path: string): string {
 export type VirtualPath = {
   collectionName: string;
   path: string;  // relative path within collection
+  indexName?: string;
 };
 
 /**
@@ -503,22 +628,26 @@ export function normalizeVirtualPath(input: string): string {
 export function parseVirtualPath(virtualPath: string): VirtualPath | null {
   // Normalize the path first
   const normalized = normalizeVirtualPath(virtualPath);
+  const [pathPart = normalized, queryString = ""] = normalized.split("?");
 
   // Match: qmd://collection-name[/optional-path]
   // Allows: qmd://name, qmd://name/, qmd://name/path
-  const match = normalized.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
+  const match = pathPart.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
   if (!match?.[1]) return null;
+  const indexName = new URLSearchParams(queryString).get("index")?.trim() || undefined;
   return {
     collectionName: match[1],
     path: match[2] ?? '',  // Empty string for collection root
+    ...(indexName ? { indexName } : {}),
   };
 }
 
 /**
  * Build a virtual path from collection name and relative path.
  */
-export function buildVirtualPath(collectionName: string, path: string): string {
-  return `qmd://${collectionName}/${path}`;
+export function buildVirtualPath(collectionName: string, path: string, indexName?: string): string {
+  const base = `qmd://${collectionName}/${path}`;
+  return indexName ? `${base}?index=${encodeURIComponent(indexName)}` : base;
 }
 
 /**
@@ -560,8 +689,8 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  * Returns null if the file is not in any indexed collection.
  */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
+  // Get all collections from DB
+  const collections = getStoreCollections(db);
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
@@ -602,6 +731,8 @@ function createSqliteVecUnavailableError(reason: string): Error {
   );
 }
 
+let _sqliteVecUnavailableReason: string | null = null;
+
 function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -620,14 +751,84 @@ export function verifySqliteVecLoaded(db: Database): void {
 
 let _sqliteVecAvailable: boolean | null = null;
 
+const CJK_CHAR_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const CJK_RUN_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+const FTS_CJK_NORMALIZED_VERSION = "1";
+
+/**
+ * FTS5's unicode61 tokenizer does not segment CJK text into searchable words.
+ * Normalize CJK runs by spacing every character so exact CJK queries can be
+ * translated into phrase queries while Latin text keeps the default tokenizer.
+ */
+export function normalizeCjkForFTS(text: string): string {
+  return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
+}
+
+function containsCjk(text: string): boolean {
+  return CJK_CHAR_PATTERN.test(text);
+}
+
+function sanitizeFTS5Phrase(phrase: string): string {
+  return normalizeCjkForFTS(phrase)
+    .split(/\s+/)
+    .map(t => sanitizeFTS5Term(t))
+    .filter(t => t)
+    .join(' ');
+}
+
+function rebuildFTSForCjkNormalization(db: Database): void {
+  const version = db.prepare(`SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`).get() as { value?: string } | undefined;
+  if (version?.value === FTS_CJK_NORMALIZED_VERSION) return;
+
+  try {
+    db.exec(`DELETE FROM documents_fts WHERE rowid >= 0`);
+  } catch {
+    // Some older/corrupt FTS5 shadow-table states can reject bulk deletes even
+    // though reads still work. Recreate the virtual table; documents_fts is a
+    // derived index, so rebuilding it from documents/content is safe.
+    db.exec(`DROP TABLE IF EXISTS documents_fts`);
+    db.exec(`
+      CREATE VIRTUAL TABLE documents_fts USING fts5(
+        filepath, title, body,
+        tokenize='porter unicode61'
+      )
+    `);
+  }
+  const rows = db.prepare(`
+    SELECT d.id, d.collection, d.path, d.title, content.doc as body
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.active = 1
+  `).all() as { id: number; collection: string; path: string; title: string; body: string }[];
+  const insert = db.prepare(`INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`);
+  const rebuild = db.transaction(() => {
+    for (const row of rows) {
+      insert.run(
+        row.id,
+        normalizeCjkForFTS(`${row.collection}/${row.path}`),
+        normalizeCjkForFTS(row.title),
+        normalizeCjkForFTS(row.body)
+      );
+    }
+  });
+  rebuild();
+  db.prepare(`
+    INSERT OR REPLACE INTO store_config(key, value)
+    VALUES ('fts_cjk_normalized_version', ?)
+  `).run(FTS_CJK_NORMALIZED_VERSION);
+}
+
 function initializeDatabase(db: Database): void {
   try {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
     _sqliteVecAvailable = true;
-  } catch {
+    _sqliteVecUnavailableReason = null;
+  } catch (err) {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
+    _sqliteVecUnavailableReason = getErrorMessage(err);
+    console.warn(_sqliteVecUnavailableReason);
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -675,21 +876,39 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Content vectors
-  const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
-  const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
-  if (cvInfo.length > 0 && !hasSeqColumn) {
-    db.exec(`DROP TABLE IF EXISTS content_vectors`);
-    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
-  }
+  // Content vectors. Avoid PRAGMA schema probes during startup; legacy vector
+  // columns are repaired lazily when a vector/embedding query first needs them.
   db.exec(`
     CREATE TABLE IF NOT EXISTS content_vectors (
       hash TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
+      embed_fingerprint TEXT NOT NULL DEFAULT '',
+      total_chunks INTEGER NOT NULL DEFAULT 1,
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
+    )
+  `);
+
+  // Store collections — makes the DB self-contained (no external config needed)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_collections (
+      name TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      pattern TEXT NOT NULL DEFAULT '**/*.md',
+      ignore_patterns TEXT,
+      include_by_default INTEGER DEFAULT 1,
+      update_command TEXT,
+      context TEXT
+    )
+  `);
+
+  // Store config — key-value metadata (e.g. config_hash for sync optimization)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_config (
+      key TEXT PRIMARY KEY,
+      value TEXT
     )
   `);
 
@@ -701,9 +920,12 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers to keep FTS in sync
+  // Triggers keep FTS in sync for callers that write directly to documents.
+  // Production indexing paths rebuild entries in TypeScript so CJK text can be
+  // normalized before it reaches the unicode61 tokenizer.
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+    CREATE TRIGGER documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
       INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -716,14 +938,16 @@ function initializeDatabase(db: Database): void {
     END
   `);
 
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
       DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
 
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    CREATE TRIGGER documents_au AFTER UPDATE ON documents
     BEGIN
       -- Delete from FTS if no longer active
       DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
@@ -738,6 +962,182 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  rebuildFTSForCjkNormalization(db);
+}
+
+// =============================================================================
+// Store Collections — DB accessor functions
+// =============================================================================
+
+type StoreCollectionRow = {
+  name: string;
+  path: string;
+  pattern: string;
+  ignore_patterns: string | null;
+  include_by_default: number;
+  update_command: string | null;
+  context: string | null;
+};
+
+function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
+  return {
+    name: row.name,
+    path: row.path,
+    pattern: row.pattern,
+    ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
+    ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
+    ...(row.update_command ? { update: row.update_command } : {}),
+    ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
+  };
+}
+
+export function getStoreCollections(db: Database): NamedCollection[] {
+  const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
+  return rows.map(rowToNamedCollection);
+}
+
+export function getStoreCollection(db: Database, name: string): NamedCollection | null {
+  const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
+  if (row == null) return null;
+  return rowToNamedCollection(row);
+}
+
+export function getStoreGlobalContext(db: Database): string | undefined {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = 'global_context'`).get() as { value: string } | null | undefined;
+  if (row == null) return undefined;
+  return row.value || undefined;
+}
+
+export function getStoreContexts(db: Database): Array<{ collection: string; path: string; context: string }> {
+  const results: Array<{ collection: string; path: string; context: string }> = [];
+
+  // Global context
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    results.push({ collection: "*", path: "/", context: globalCtx });
+  }
+
+  // Collection contexts
+  const rows = db.prepare(`SELECT name, context FROM store_collections WHERE context IS NOT NULL`).all() as { name: string; context: string }[];
+  for (const row of rows) {
+    const ctxMap = JSON.parse(row.context) as ContextMap;
+    for (const [path, context] of Object.entries(ctxMap)) {
+      results.push({ collection: row.name, path, context });
+    }
+  }
+
+  return results;
+}
+
+export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  db.prepare(`
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      path = excluded.path,
+      pattern = excluded.pattern,
+      ignore_patterns = excluded.ignore_patterns,
+      include_by_default = excluded.include_by_default,
+      update_command = excluded.update_command,
+      context = excluded.context
+  `).run(
+    name,
+    collection.path,
+    collection.pattern || '**/*.md',
+    collection.ignore ? JSON.stringify(collection.ignore) : null,
+    collection.includeByDefault === false ? 0 : 1,
+    collection.update || null,
+    collection.context ? JSON.stringify(collection.context) : null,
+  );
+}
+
+export function deleteStoreCollection(db: Database, name: string): boolean {
+  const result = db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(name);
+  return result.changes > 0;
+}
+
+export function renameStoreCollection(db: Database, oldName: string, newName: string): boolean {
+  // Check target doesn't exist
+  const existing = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(newName) as { name: string } | null | undefined;
+  if (existing != null) {
+    throw new Error(`Collection '${newName}' already exists`);
+  }
+
+  const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
+  return result.changes > 0;
+}
+
+export function updateStoreContext(db: Database, collectionName: string, path: string, text: string): boolean {
+  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
+  if (row == null) return false;
+
+  const ctxMap: ContextMap = row.context ? JSON.parse(row.context) : {};
+  ctxMap[path] = text;
+  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(JSON.stringify(ctxMap), collectionName);
+  return true;
+}
+
+export function removeStoreContext(db: Database, collectionName: string, path: string): boolean {
+  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
+  if (row == null) return false;
+  if (!row.context) return false;
+
+  const ctxMap: ContextMap = JSON.parse(row.context);
+  if (!(path in ctxMap)) return false;
+
+  delete ctxMap[path];
+  const newCtx = Object.keys(ctxMap).length > 0 ? JSON.stringify(ctxMap) : null;
+  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(newCtx, collectionName);
+  return true;
+}
+
+export function setStoreGlobalContext(db: Database, value: string | undefined): void {
+  if (value === undefined) {
+    db.prepare(`DELETE FROM store_config WHERE key = 'global_context'`).run();
+  } else {
+    db.prepare(`INSERT INTO store_config (key, value) VALUES ('global_context', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(value);
+  }
+}
+
+/**
+ * Sync external config (YAML/inline) into SQLite store_collections.
+ * External config always wins. Skips sync if config hash hasn't changed.
+ */
+export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  // Check config hash — skip sync if unchanged
+  const configJson = JSON.stringify(config);
+  const hash = createHash('sha256').update(configJson).digest('hex');
+
+  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
+  if (existingHash != null && existingHash.value === hash) {
+    return; // Config unchanged, skip sync
+  }
+
+  // Sync collections
+  const configNames = new Set(Object.keys(config.collections));
+
+  for (const [name, coll] of Object.entries(config.collections)) {
+    upsertStoreCollection(db, name, coll);
+  }
+
+  // Delete collections not in config
+  const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
+  for (const row of dbCollections) {
+    if (!configNames.has(row.name)) {
+      db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+    }
+  }
+
+  // Sync global context
+  if (config.global_context !== undefined) {
+    setStoreGlobalContext(db, config.global_context);
+  } else {
+    setStoreGlobalContext(db, undefined);
+  }
+
+  // Save config hash
+  db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
 }
 
 
@@ -747,7 +1147,9 @@ export function isSqliteVecAvailable(): boolean {
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
-    throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
+    throw createSqliteVecUnavailableError(
+      _sqliteVecUnavailableReason ?? "vector operations require a SQLite build with extension loading support"
+    );
   }
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
@@ -756,7 +1158,12 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
     if (existingDims === dimensions && hasHashSeq && hasCosine) return;
-    // Table exists but wrong schema - need to rebuild
+    if (existingDims !== null && existingDims !== dimensions) {
+      throw new Error(
+        `Embedding dimension mismatch: existing vectors are ${existingDims}d but the current model produces ${dimensions}d. ` +
+        `Run 'qmd embed -f' to re-embed with the new model.`
+      );
+    }
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
@@ -769,13 +1176,15 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
+  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
+  llm?: LlamaCpp;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
   // Index health
-  getHashesNeedingEmbedding: () => number;
-  getIndexHealth: () => IndexHealthInfo;
-  getStatus: () => IndexStatus;
+  getHashesNeedingEmbedding: (model?: string) => number;
+  getIndexHealth: (model?: string) => IndexHealthInfo;
+  getStatus: (model?: string) => IndexStatus;
 
   // Caching
   getCacheKey: typeof getCacheKey;
@@ -809,8 +1218,8 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -826,6 +1235,7 @@ export type Store = {
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
@@ -834,8 +1244,599 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
+
+// =============================================================================
+// Reindex & Embed — pure-logic functions for SDK and CLI
+// =============================================================================
+
+export type ReindexProgress = {
+  file: string;
+  current: number;
+  total: number;
+};
+
+export type ReindexResult = {
+  indexed: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  orphanedCleaned: number;
+};
+
+/**
+ * Re-index a single collection by scanning the filesystem and updating the database.
+ * Pure function — no console output, no db lifecycle management.
+ */
+export async function reindexCollection(
+  store: Store,
+  collectionPath: string,
+  globPattern: string,
+  collectionName: string,
+  options?: {
+    ignorePatterns?: string[];
+    onProgress?: (info: ReindexProgress) => void;
+  }
+): Promise<ReindexResult> {
+  const db = store.db;
+  const now = new Date().toISOString();
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(options?.ignorePatterns || []),
+  ];
+  const allFiles: string[] = await fastGlob(globPattern, {
+    cwd: collectionPath,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+    ignore: allIgnore,
+  });
+  // Filter hidden files/folders
+  const files = allFiles.filter(file => {
+    const parts = file.split("/");
+    return !parts.some(part => part.startsWith("."));
+  });
+
+  const total = files.length;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const seenPaths = new Set<string>();
+
+  for (const relativeFile of files) {
+    const filepath = getRealPath(resolve(collectionPath, relativeFile));
+    // Store the literal relative path so the filesystem path can always be
+    // reconstructed as: resolve(collection.path, storedPath).
+    // handelize() is NOT applied at index time — it is display-only.
+    const path = normalizePathSeparators(relativeFile);
+    seenPaths.add(path);
+
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch {
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
+    if (!content.trim()) {
+      processed++;
+      continue;
+    }
+
+    const hash = await hashContent(content);
+    const title = extractTitle(content, relativeFile);
+
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+
+    if (existing) {
+      if (existing.hash === hash) {
+        if (existing.title !== title) {
+          updateDocumentTitle(db, existing.id, title, now);
+          updated++;
+        } else {
+          unchanged++;
+        }
+      } else {
+        insertContent(db, hash, content, now);
+        const stat = statSync(filepath);
+        updateDocument(db, existing.id, title, hash,
+          stat ? new Date(stat.mtime).toISOString() : now);
+        updated++;
+      }
+    } else {
+      indexed++;
+      insertContent(db, hash, content, now);
+      const stat = statSync(filepath);
+      insertDocument(db, collectionName, path, title, hash,
+        stat ? new Date(stat.birthtime).toISOString() : now,
+        stat ? new Date(stat.mtime).toISOString() : now);
+    }
+
+    processed++;
+    options?.onProgress?.({ file: relativeFile, current: processed, total });
+  }
+
+  // Deactivate documents that no longer exist
+  const allActive = getActiveDocumentPaths(db, collectionName);
+  let removed = 0;
+  for (const path of allActive) {
+    if (!seenPaths.has(path)) {
+      deactivateDocument(db, collectionName, path);
+      removed++;
+    }
+  }
+
+  const orphanedCleaned = cleanupOrphanedContent(db);
+
+  return { indexed, updated, unchanged, removed, orphanedCleaned };
+}
+
+export type EmbedFailure = {
+  path: string;
+  hash: string;
+  seq: number;
+  attempts: number;
+  reason: string;
+};
+
+export type EmbedProgress = {
+  chunksEmbedded: number;
+  totalChunks: number;
+  bytesProcessed: number;
+  totalBytes: number;
+  /** Active failed chunks still awaiting a successful retry. */
+  errors: number;
+  failures?: EmbedFailure[];
+};
+
+export type EmbedResult = {
+  docsProcessed: number;
+  chunksEmbedded: number;
+  /** Active failed chunks that did not recover after retries. */
+  errors: number;
+  failures?: EmbedFailure[];
+  durationMs: number;
+};
+
+export type EmbedOptions = {
+  force?: boolean;
+  model?: string;
+  /**
+   * Restrict embedding to documents in a single collection.
+   * When omitted, all pending documents across every collection are embedded.
+   */
+  collection?: string;
+  maxDocsPerBatch?: number;
+  maxBatchBytes?: number;
+  chunkStrategy?: ChunkStrategy;
+  onProgress?: (info: EmbedProgress) => void;
+};
+
+type PendingEmbeddingDoc = {
+  hash: string;
+  path: string;
+  bytes: number;
+};
+
+type EmbeddingDoc = PendingEmbeddingDoc & {
+  body: string;
+};
+
+type ChunkItem = {
+  hash: string;
+  path: string;
+  title: string;
+  text: string;
+  seq: number;
+  pos: number;
+  tokens: number;
+  bytes: number;
+  expectedTotalChunks: number;
+};
+
+function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions, "maxDocsPerBatch" | "maxBatchBytes">> {
+  return {
+    maxDocsPerBatch: validatePositiveIntegerOption("maxDocsPerBatch", options?.maxDocsPerBatch, DEFAULT_EMBED_MAX_DOCS_PER_BATCH),
+    maxBatchBytes: validatePositiveIntegerOption("maxBatchBytes", options?.maxBatchBytes, DEFAULT_EMBED_MAX_BATCH_BYTES),
+  };
+}
+
+const CONTENT_VECTOR_DESIRED_COLUMNS: { name: string; definition: string }[] = [
+  { name: "seq", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { name: "pos", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { name: "model", definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: "embed_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: "total_chunks", definition: "INTEGER NOT NULL DEFAULT 1" },
+  { name: "embedded_at", definition: "TEXT NOT NULL DEFAULT ''" },
+];
+
+function isContentVectorColumnError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/(no such column|has no column named)/i.test(message)) {
+    return false;
+  }
+  return CONTENT_VECTOR_DESIRED_COLUMNS.some(col => message.includes(col.name));
+}
+
+function runContentVectorColumnRepairs(db: Database): void {
+  for (const column of CONTENT_VECTOR_DESIRED_COLUMNS) {
+    try {
+      db.exec(`ALTER TABLE content_vectors ADD COLUMN ${column.name} ${column.definition}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // The repair series is intentionally idempotent: most columns should
+      // already exist, and another caller may have repaired a missing column
+      // between the failed query and this ALTER series.
+      if (!message.includes("duplicate column name")) {
+        throw error;
+      }
+    }
+  }
+}
+
+function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T {
+  let repaired = false;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (repaired || !isContentVectorColumnError(error)) {
+        throw error;
+      }
+      runContentVectorColumnRepairs(db);
+      repaired = true;
+    }
+  }
+}
+
+function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+      SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+      FROM documents d
+      JOIN content c ON d.hash = c.hash
+      LEFT JOIN (
+        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        FROM content_vectors
+        WHERE model = ? AND embed_fingerprint = ?
+        GROUP BY hash, model, embed_fingerprint
+      ) v ON d.hash = v.hash
+      WHERE d.active = 1
+        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${collectionFilter}
+      GROUP BY d.hash
+      ORDER BY MIN(d.path)
+    `);
+    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+  });
+}
+
+function buildEmbeddingBatches(
+  docs: PendingEmbeddingDoc[],
+  maxDocsPerBatch: number,
+  maxBatchBytes: number,
+): PendingEmbeddingDoc[][] {
+  const batches: PendingEmbeddingDoc[][] = [];
+  let currentBatch: PendingEmbeddingDoc[] = [];
+  let currentBytes = 0;
+
+  for (const doc of docs) {
+    const docBytes = Math.max(0, doc.bytes);
+    const wouldExceedDocs = currentBatch.length >= maxDocsPerBatch;
+    const wouldExceedBytes = currentBatch.length > 0 && (currentBytes + docBytes) > maxBatchBytes;
+
+    if (wouldExceedDocs || wouldExceedBytes) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    }
+
+    currentBatch.push(doc);
+    currentBytes += docBytes;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
+}
+
+function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): EmbeddingDoc[] {
+  if (batch.length === 0) return [];
+
+  const placeholders = batch.map(() => "?").join(",");
+  const rows = db.prepare(`
+    SELECT hash, doc as body
+    FROM content
+    WHERE hash IN (${placeholders})
+  `).all(...batch.map(doc => doc.hash)) as { hash: string; body: string }[];
+  const bodyByHash = new Map(rows.map(row => [row.hash, row.body]));
+
+  return batch.map((doc) => ({
+    ...doc,
+    body: bodyByHash.get(doc.hash) ?? "",
+  }));
+}
+
+/**
+ * Generate vector embeddings for documents that need them.
+ * Pure function — no console output, no db lifecycle management.
+ * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ */
+export async function generateEmbeddings(
+  store: Store,
+  options?: EmbedOptions
+): Promise<EmbedResult> {
+  const db = store.db;
+  const llm = getLlm(store);
+  const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+  const fingerprint = getEmbeddingFingerprint(model);
+  const now = new Date().toISOString();
+  const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
+  const encoder = new TextEncoder();
+
+  if (options?.force) {
+    clearAllEmbeddings(db, options?.collection);
+  }
+
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+
+  if (docsToEmbed.length === 0) {
+    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+  }
+  const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+  const totalDocs = docsToEmbed.length;
+  const startTime = Date.now();
+
+  // Use store's LlamaCpp or global singleton, wrapped in a session
+  const embedModelUri = model;
+
+  // Create a session manager for this llm instance
+  const result = await withLLMSessionForLlm(llm, async (session) => {
+    let chunksEmbedded = 0;
+    let bytesProcessed = 0;
+    let totalChunks = 0;
+    let vectorTableInitialized = false;
+    const BATCH_SIZE = 32;
+    const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
+    const MAX_RETRY_ATTEMPTS = 3;
+    const failures = new Map<string, EmbedFailure>();
+    const retryQueue = new Map<string, ChunkItem>();
+    let successesSinceRetry = 0;
+
+    const failureList = () => [...failures.values()];
+    const activeErrorCount = () => failures.size;
+    const chunkKey = (chunk: ChunkItem) => `${chunk.hash}:${chunk.seq}`;
+    const reasonFromError = (error: unknown) => {
+      const raw = error instanceof Error ? error.message : String(error);
+      return raw.length > 180 ? `${raw.slice(0, 177)}...` : raw;
+    };
+    const recordFailure = (chunk: ChunkItem, reason: string) => {
+      const key = chunkKey(chunk);
+      const previous = failures.get(key);
+      failures.set(key, {
+        path: chunk.path,
+        hash: chunk.hash,
+        seq: chunk.seq,
+        attempts: (previous?.attempts ?? 0) + 1,
+        reason,
+      });
+      retryQueue.set(key, chunk);
+    };
+    const clearFailure = (chunk: ChunkItem) => {
+      const key = chunkKey(chunk);
+      failures.delete(key);
+      retryQueue.delete(key);
+    };
+    const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
+      try {
+        const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
+        const result = await session.embed(text, { model });
+        if (!result) {
+          recordFailure(chunk, "embedding returned no vector");
+          return false;
+        }
+        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        chunksEmbedded++;
+        successesSinceRetry++;
+        clearFailure(chunk);
+        return true;
+      } catch (error) {
+        recordFailure(chunk, reasonFromError(error));
+        return false;
+      }
+    };
+    const retryFailedChunks = async (force = false) => {
+      if (!session.isValid || retryQueue.size === 0) return;
+      if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS) return;
+      successesSinceRetry = 0;
+
+      // Normal mode: one retry pass after enough unrelated chunks succeeded.
+      // Force mode: we have run out of other chunks for this batch, so keep
+      // retrying outstanding failures until they recover or hit the cap. The
+      // cap prevents endless loops on permanently bad chunks.
+      do {
+        let retried = 0;
+        for (const [key, chunk] of [...retryQueue]) {
+          const failure = failures.get(key);
+          if (!failure || failure.attempts >= MAX_RETRY_ATTEMPTS) continue;
+          retried++;
+          await tryEmbedChunk(chunk);
+        }
+        if (!force || retried === 0) break;
+      } while (session.isValid && [...retryQueue].some(([key]) => {
+        const failure = failures.get(key);
+        return !!failure && failure.attempts < MAX_RETRY_ATTEMPTS;
+      }));
+    };
+    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+
+    for (const batchMeta of batches) {
+      // Abort early if session has been invalidated
+      if (!session.isValid) {
+        console.warn(`⚠ Session expired — skipping remaining document batches`);
+        break;
+      }
+
+      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+      const batchChunks: ChunkItem[] = [];
+      const expectedChunksByHash = new Map<string, number>();
+      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+
+      for (const doc of batchDocs) {
+        if (!doc.body.trim()) continue;
+
+        const title = extractTitle(doc.body, doc.path);
+        const chunks = await chunkDocumentByTokens(
+          doc.body,
+          undefined, undefined, undefined,
+          doc.path,
+          options?.chunkStrategy,
+          session.signal,
+        );
+
+        for (let seq = 0; seq < chunks.length; seq++) {
+          batchChunks.push({
+            hash: doc.hash,
+            path: doc.path,
+            title,
+            text: chunks[seq]!.text,
+            seq,
+            pos: chunks[seq]!.pos,
+            tokens: chunks[seq]!.tokens,
+            bytes: encoder.encode(chunks[seq]!.text).length,
+            expectedTotalChunks: chunks.length,
+          });
+        }
+        expectedChunksByHash.set(doc.hash, chunks.length);
+      }
+
+      totalChunks += batchChunks.length;
+
+      if (batchChunks.length === 0) {
+        bytesProcessed += batchBytes;
+        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
+        continue;
+      }
+
+      if (!vectorTableInitialized) {
+        const firstChunk = batchChunks[0]!;
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
+        const firstResult = await session.embed(firstText, { model });
+        if (!firstResult) {
+          throw new Error("Failed to get embedding dimensions from first chunk");
+        }
+        store.ensureVecTable(firstResult.embedding.length);
+        vectorTableInitialized = true;
+      }
+
+      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      let batchChunkBytesProcessed = 0;
+
+      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+        // Abort early if session has been invalidated (e.g. max duration exceeded)
+        if (!session.isValid) {
+          const remainingChunks = batchChunks.slice(batchStart);
+          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
+          console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
+          break;
+        }
+
+        // Abort early if active error rate is too high (>80% of attempted chunks failed)
+        const processed = chunksEmbedded + activeErrorCount();
+        if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
+          const remainingChunks = batchChunks.slice(batchStart);
+          for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
+          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
+          break;
+        }
+
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+
+        try {
+          const embeddings = await session.embedBatch(texts, { model });
+          for (let i = 0; i < chunkBatch.length; i++) {
+            const chunk = chunkBatch[i]!;
+            const embedding = embeddings[i];
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+              chunksEmbedded++;
+              successesSinceRetry++;
+              clearFailure(chunk);
+            } else {
+              recordFailure(chunk, "batch embedding returned no vector");
+            }
+            batchChunkBytesProcessed += chunk.bytes;
+          }
+          await retryFailedChunks();
+        } catch (error) {
+          // Batch failed — try individual embeddings as fallback. If an
+          // individual retry succeeds, any prior failure for that chunk is
+          // cleared, so the visible error count reflects outstanding failures.
+          const batchReason = reasonFromError(error);
+          if (!session.isValid) {
+            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
+          } else {
+            for (const chunk of chunkBatch) {
+              await tryEmbedChunk(chunk);
+              batchChunkBytesProcessed += chunk.bytes;
+              await retryFailedChunks();
+            }
+          }
+        }
+
+        const proportionalBytes = totalBatchChunkBytes === 0
+          ? batchBytes
+          : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+        options?.onProgress?.({
+          chunksEmbedded,
+          totalChunks,
+          bytesProcessed: bytesProcessed + proportionalBytes,
+          totalBytes,
+          errors: activeErrorCount(),
+          failures: failureList(),
+        });
+      }
+
+      await retryFailedChunks(true);
+
+      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+      if (removedPartialChunks > 0) {
+        chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+      }
+
+      bytesProcessed += batchBytes;
+      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
+    }
+
+    return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
+  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+
+  return {
+    docsProcessed: totalDocs,
+    chunksEmbedded: result.chunksEmbedded,
+    errors: result.errors,
+    failures: result.failures,
+    durationMs: Date.now() - startTime,
+  };
+}
 
 /**
  * Create a new store instance with the given database path.
@@ -849,16 +1850,16 @@ export function createStore(dbPath?: string): Store {
   const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
-  return {
+  const store: Store = {
     db,
     dbPath: resolvedPath,
     close: () => db.close(),
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
-    getIndexHealth: () => getIndexHealth(db),
-    getStatus: () => getStatus(db),
+    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
 
     // Caching
     getCacheKey,
@@ -892,8 +1893,8 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -909,6 +1910,7 @@ export function createStore(dbPath?: string): Store {
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
     insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
+    findOrMigrateLegacyDocument: (collectionName: string, path: string) => findOrMigrateLegacyDocument(db, collectionName, path),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
@@ -917,8 +1919,10 @@ export function createStore(dbPath?: string): Store {
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
   };
+
+  return store;
 }
 
 // =============================================================================
@@ -952,32 +1956,44 @@ export function getDocid(hash: string): string {
 /**
  * Handelize a filename to be more token-friendly.
  * - Convert triple underscore `___` to `/` (folder separator)
- * - Convert to lowercase
  * - Replace sequences of non-word chars (except /) with single dash
  * - Remove leading/trailing dashes from path segments
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
+ * - Preserve original case (important for case-sensitive filesystems)
  */
+/** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
+function emojiToHex(str: string): string {
+  return str.replace(/(?:\p{So}\p{Mn}?|\p{Sk})+/gu, (run) => {
+    // Split the run into individual emoji and convert each to hex, dash-separated
+    return [...run].filter(c => /\p{So}|\p{Sk}/u.test(c))
+      .map(c => c.codePointAt(0)!.toString(16)).join('-');
+  });
+}
+
 export function handelize(path: string): string {
   if (!path || path.trim() === '') {
     throw new Error('handelize: path cannot be empty');
   }
 
   // Allow route-style "$" filenames while still rejecting paths with no usable content.
+  // Emoji (\p{So}) counts as valid content — they get converted to hex codepoints below.
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}$]/u.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}\p{So}\p{Sk}$]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
+
+      // Convert emoji to hex codepoints before cleaning
+      segment = emojiToHex(segment);
 
       if (isLastSegment) {
         // For the filename (last segment), preserve the extension
@@ -986,7 +2002,7 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep letters, numbers, "$"; dash-separate rest (including dots)
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
@@ -1027,6 +2043,41 @@ export type RankedResult = {
   score: number;
 };
 
+export type RRFContributionTrace = {
+  listIndex: number;
+  source: "fts" | "vec";
+  queryType: "original" | "lex" | "vec" | "hyde";
+  query: string;
+  rank: number;            // 1-indexed rank within list
+  weight: number;
+  backendScore: number;    // Backend-normalized score before fusion
+  rrfContribution: number; // weight / (k + rank)
+};
+
+export type RRFScoreTrace = {
+  contributions: RRFContributionTrace[];
+  baseScore: number;       // Sum of reciprocal-rank contributions
+  topRank: number;         // Best (lowest) rank seen across lists
+  topRankBonus: number;    // +0.05 for rank 1, +0.02 for rank 2-3
+  totalScore: number;      // baseScore + topRankBonus
+};
+
+export type HybridQueryExplain = {
+  ftsScores: number[];
+  vectorScores: number[];
+  rrf: {
+    rank: number;          // Rank after RRF fusion (1-indexed)
+    positionScore: number; // 1 / rank used in position-aware blending
+    weight: number;        // Position-aware RRF weight (0.75 / 0.60 / 0.40)
+    baseScore: number;
+    topRankBonus: number;
+    totalScore: number;
+    contributions: RRFContributionTrace[];
+  };
+  rerankScore: number;
+  blendedScore: number;
+};
+
 /**
  * Error result when document is not found
  */
@@ -1050,8 +2101,8 @@ export type MultiGetResult = {
 
 export type CollectionInfo = {
   name: string;
-  path: string;
-  pattern: string;
+  path: string | null;
+  pattern: string | null;
   documents: number;
   lastUpdated: string;
 };
@@ -1067,14 +2118,26 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
-  const result = db.prepare(`
-    SELECT COUNT(DISTINCT d.hash) as count
-    FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
-  return result.count;
+export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+      SELECT COUNT(DISTINCT d.hash) as count
+      FROM documents d
+      LEFT JOIN (
+        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        FROM content_vectors
+        WHERE model = ? AND embed_fingerprint = ?
+        GROUP BY hash, model, embed_fingerprint
+      ) v ON d.hash = v.hash
+      WHERE d.active = 1
+        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${collectionFilter}
+    `);
+    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    return result.count;
+  });
 }
 
 export type IndexHealthInfo = {
@@ -1083,8 +2146,81 @@ export type IndexHealthInfo = {
   daysStale: number | null;
 };
 
-export function getIndexHealth(db: Database): IndexHealthInfo {
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+export type LegacyFingerprintAdoptionResult = {
+  checked: boolean;
+  adopted: number;
+  reason: string;
+};
+
+export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+  const db = store.db;
+  const fingerprint = getEmbeddingFingerprint(model);
+  const legacyCount = withLazyContentVectorMigration(db, () => {
+    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
+    return row.count;
+  });
+  if (legacyCount === 0) {
+    return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
+  }
+
+  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    JOIN content c ON c.hash = cv.hash
+    WHERE cv.model = ? AND cv.embed_fingerprint = ''
+    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
+    ORDER BY cv.hash, cv.seq
+    LIMIT 1
+  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+
+  if (!sample) {
+    return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
+  }
+
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) {
+    return { checked: false, adopted: 0, reason: "vectors_vec table is missing" };
+  }
+
+  const expectedHashSeq = `${sample.hash}_${sample.seq}`;
+  const title = extractTitle(sample.body, sample.path);
+  const llm = getLlm(store);
+
+  return await withLLMSessionForLlm(llm, async (session) => {
+    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunk = chunks[sample.seq];
+    if (!chunk) {
+      return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
+    }
+
+    const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+    if (!result) {
+      return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
+    }
+
+    const nearest = db.prepare(`
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = 1
+    `).get(new Float32Array(result.embedding)) as { hash_seq: string; distance: number } | undefined;
+
+    if (!nearest) {
+      return { checked: true, adopted: 0, reason: "legacy sample vector not found" };
+    }
+
+    const threshold = 0.0001;
+    if (nearest.hash_seq !== expectedHashSeq || nearest.distance > threshold) {
+      return { checked: true, adopted: 0, reason: `legacy sample differs from current fingerprint (nearest ${nearest.hash_seq}, distance ${nearest.distance.toFixed(6)})` };
+    }
+
+    const update = withLazyContentVectorMigration(db, () => db.prepare(`UPDATE content_vectors SET embed_fingerprint = ? WHERE model = ? AND embed_fingerprint = ''`).run(fingerprint, model));
+    return { checked: true, adopted: update.changes, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}` };
+  });
+}
+
+export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
   const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
 
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -1148,13 +2284,15 @@ export function deleteInactiveDocuments(db: Database): number {
 }
 
 /**
- * Remove orphaned content hashes that are not referenced by any active document.
+ * Remove orphaned content hashes that are not referenced by any document.
+ * Inactive documents are soft-deleted tombstones, so their content rows must
+ * remain referenced until deleteInactiveDocuments() hard-deletes them.
  * Returns the number of orphaned content hashes deleted.
  */
 export function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
   `).run();
   return result.changes;
 }
@@ -1164,45 +2302,55 @@ export function cleanupOrphanedContent(db: Database): number {
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
-  // Check if vectors_vec table exists
-  const tableExists = db.prepare(`
-    SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-  `).get();
-
-  if (!tableExists) {
+  // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
+  // The vectors_vec virtual table can appear in sqlite_master from a prior
+  // session, but querying it without the vec0 module loaded will crash (#380).
+  if (!isSqliteVecAvailable()) {
     return 0;
   }
 
-  // Count orphaned vectors first
-  const countResult = db.prepare(`
-    SELECT COUNT(*) as c FROM content_vectors cv
-    WHERE NOT EXISTS (
-      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-    )
-  `).get() as { c: number };
-
-  if (countResult.c === 0) {
+  // The schema entry can exist even when sqlite-vec itself is unavailable
+  // (for example when reopening a DB without vec0 loaded). In that case,
+  // touching the virtual table throws "no such module: vec0" and cleanup
+  // should degrade gracefully like the rest of the vector features.
+  try {
+    db.prepare(`SELECT 1 FROM vectors_vec LIMIT 0`).get();
+  } catch {
     return 0;
   }
 
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+  return withLazyContentVectorMigration(db, () => {
+    // Count orphaned vectors first
+    const countResult = db.prepare(`
+      SELECT COUNT(*) as c FROM content_vectors cv
       WHERE NOT EXISTS (
         SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
       )
-    )
-  `);
+    `).get() as { c: number };
 
-  // Delete from content_vectors
-  db.exec(`
-    DELETE FROM content_vectors WHERE hash NOT IN (
-      SELECT hash FROM documents WHERE active = 1
-    )
-  `);
+    if (countResult.c === 0) {
+      return 0;
+    }
 
-  return countResult.c;
+    // Delete from vectors_vec first
+    db.exec(`
+      DELETE FROM vectors_vec WHERE hash_seq IN (
+        SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+        WHERE NOT EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
+      )
+    `);
+
+    // Delete from content_vectors
+    db.exec(`
+      DELETE FROM content_vectors WHERE hash NOT IN (
+        SELECT hash FROM documents WHERE active = 1
+      )
+    `);
+
+    return countResult.c;
+  });
 }
 
 /**
@@ -1268,6 +2416,28 @@ export function insertContent(db: Database, hash: string, content: string, creat
     .run(hash, content, createdAt);
 }
 
+function rebuildDocumentFTS(db: Database, documentId: number): void {
+  const row = db.prepare(`
+    SELECT d.id, d.collection, d.path, d.title, content.doc as body
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.id = ? AND d.active = 1
+  `).get(documentId) as { id: number; collection: string; path: string; title: string; body: string } | undefined;
+
+  db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(documentId);
+  if (!row) return;
+
+  db.prepare(`
+    INSERT INTO documents_fts(rowid, filepath, title, body)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    row.id,
+    normalizeCjkForFTS(`${row.collection}/${row.path}`),
+    normalizeCjkForFTS(row.title),
+    normalizeCjkForFTS(row.body)
+  );
+}
+
 /**
  * Insert a new document into the documents table.
  */
@@ -1289,6 +2459,9 @@ export function insertDocument(
       modified_at = excluded.modified_at,
       active = 1
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+
+  const row = db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`).get(collectionName, path) as { id: number } | undefined;
+  if (row) rebuildDocumentFTS(db, row.id);
 }
 
 /**
@@ -1307,6 +2480,73 @@ export function findActiveDocument(
 }
 
 /**
+ * Find an active document, falling back to a case-insensitive path match.
+ * If found under a different casing, renames it in-place and rebuilds the
+ * FTS entry. Embeddings are keyed by content hash, so the rename is
+ * safe — no re-embedding required.
+ *
+ * @internal Used by reindexCollection and indexFiles during qmd update.
+ * Returns null if the document does not exist under either path.
+ */
+export function findOrMigrateLegacyDocument(
+  db: Database,
+  collectionName: string,
+  path: string
+): { id: number; hash: string; title: string } | null {
+  const existing = findActiveDocument(db, collectionName, path);
+  if (existing) return existing;
+
+  // Case-insensitive match (legacy normalization: e.g. "README.md" → "readme.md").
+  const legacyCase = db.prepare(`
+    SELECT id, hash, title FROM documents
+    WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
+    ORDER BY id
+    LIMIT 1
+  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+
+  // Handalized-path match: existing DBs indexed with handelize() stored slugged paths
+  // like "Budget-Revenue-Q4-2024.md" for a raw path like "Budget & Revenue (Q4) [2024].md".
+  // Try matching the handalized form of the incoming raw path against the DB so that
+  // qmd update on an old index can rename the row to the literal path.
+  let legacyHandalized: { id: number; hash: string; title: string } | undefined;
+  try {
+    const handleized = handelize(path);
+    if (handleized !== path) {
+      legacyHandalized = db.prepare(`
+        SELECT id, hash, title FROM documents
+        WHERE collection = ? AND path = ? AND active = 1
+        ORDER BY id
+        LIMIT 1
+      `).get(collectionName, handleized) as { id: number; hash: string; title: string } | undefined;
+    }
+  } catch {
+    // handelize throws on invalid paths; just skip
+  }
+
+  const legacy = legacyCase ?? legacyHandalized;
+  if (!legacy) return null;
+
+  // Wrap rename + FTS rebuild in a transaction for atomicity.
+  const migrate = db.transaction(() => {
+    // Use OR IGNORE so a UNIQUE conflict (e.g. both "readme.md" and
+    // "README.md" already exist) is a no-op rather than crashing.
+    const result = db.prepare(
+      `UPDATE OR IGNORE documents SET path = ? WHERE id = ? AND active = 1`
+    ).run(path, legacy.id);
+
+    if (result.changes === 0) return false;
+
+    rebuildDocumentFTS(db, legacy.id);
+
+    return true;
+  });
+
+  if (!migrate()) return null;
+
+  return findActiveDocument(db, collectionName, path);
+}
+
+/**
  * Update the title and modified_at timestamp for a document.
  */
 export function updateDocumentTitle(
@@ -1317,6 +2557,7 @@ export function updateDocumentTitle(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
     .run(title, modifiedAt, documentId);
+  rebuildDocumentFTS(db, documentId);
 }
 
 /**
@@ -1332,6 +2573,7 @@ export function updateDocument(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(title, hash, modifiedAt, documentId);
+  rebuildDocumentFTS(db, documentId);
 }
 
 /**
@@ -1354,78 +2596,67 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
+/**
+ * Chunk a document using regex-only break point detection.
+ * This is the sync, backward-compatible API used by tests and legacy callers.
+ */
 export function chunkDocument(
   content: string,
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  if (content.length <= maxChars) {
-    return [{ text: content, pos: 0 }];
-  }
-
-  // Pre-scan all break points and code fences once
   const breakPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+}
 
-  const chunks: { text: string; pos: number }[] = [];
-  let charPos = 0;
+/**
+ * Async AST-aware chunking. Detects language from filepath, computes AST
+ * break points for supported code files, merges with regex break points,
+ * and delegates to the shared chunk algorithm.
+ *
+ * Falls back to regex-only when strategy is "regex", filepath is absent,
+ * or language is unsupported.
+ */
+export async function chunkDocumentAsync(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+): Promise<{ text: string; pos: number }[]> {
+  const regexPoints = scanBreakPoints(content);
+  const codeFences = findCodeFences(content);
 
-  while (charPos < content.length) {
-    // Calculate target end position for this chunk
-    const targetEndPos = Math.min(charPos + maxChars, content.length);
-
-    let endPos = targetEndPos;
-
-    // If not at the end, find the best break point
-    if (endPos < content.length) {
-      // Find best cutoff using scored algorithm
-      const bestCutoff = findBestCutoff(
-        breakPoints,
-        targetEndPos,
-        windowChars,
-        0.7,
-        codeFences
-      );
-
-      // Only use the cutoff if it's within our current chunk
-      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
-        endPos = bestCutoff;
-      }
-    }
-
-    // Ensure we make progress
-    if (endPos <= charPos) {
-      endPos = Math.min(charPos + maxChars, content.length);
-    }
-
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
-
-    // Move forward, but overlap with previous chunk
-    // For last chunk, don't overlap (just go to the end)
-    if (endPos >= content.length) {
-      break;
-    }
-    charPos = endPos - overlapChars;
-    const lastChunkPos = chunks.at(-1)!.pos;
-    if (charPos <= lastChunkPos) {
-      // Prevent infinite loop - move forward at least a bit
-      charPos = endPos;
+  let breakPoints = regexPoints;
+  if (chunkStrategy === "auto" && filepath) {
+    const { getASTBreakPoints } = await import("./ast.js");
+    const astPoints = await getASTBreakPoints(content, filepath);
+    if (astPoints.length > 0) {
+      breakPoints = mergeBreakPoints(regexPoints, astPoints);
     }
   }
 
-  return chunks;
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
 }
 
 /**
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
+ *
+ * When filepath and chunkStrategy are provided, uses AST-aware break points
+ * for supported code files.
  */
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+  signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
@@ -1437,33 +2668,72 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  // Use AST-aware chunking for the first pass when filepath/strategy provided
+  let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
+  const clampOverlapChars = (value: number, maxChars: number): number => {
+    if (maxChars <= 1) return 0;
+    return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
+  };
+
+  const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+    if (signal?.aborted) return;
+
+    const tokens = await llm.tokenize(text);
+    if (tokens.length <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokens.length });
+      return;
+    }
+
+    const actualCharsPerToken = text.length / tokens.length;
+    let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+    if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+      safeMaxChars = Math.floor(text.length / 2);
+    }
+    safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+    let nextOverlapChars = clampOverlapChars(
+      overlapChars * actualCharsPerToken / 2,
+      safeMaxChars,
+    );
+    let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+    let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+    // Pathological single-line blobs can produce no meaningful breakpoint progress.
+    // Fall back to a simple half split so every recursion step strictly shrinks.
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+      nextOverlapChars = 0;
+      nextWindowChars = 0;
+      subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+    }
+
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+      const truncatedText = await llm.detokenize(fallbackTokens);
+      results.push({
+        text: truncatedText,
+        pos,
+        tokens: fallbackTokens.length,
+      });
+      return;
+    }
+
+    for (const subChunk of subChunks) {
+      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+    }
+  };
 
   for (const chunk of charChunks) {
-    const tokens = await llm.tokenize(chunk.text);
-
-    if (tokens.length <= maxTokens) {
-      results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
-    } else {
-      // Chunk is still too large - split it further
-      // Use actual token count to estimate better char limit
-      const actualCharsPerToken = chunk.text.length / tokens.length;
-      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
-
-      const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
-
-      for (const subChunk of subChunks) {
-        const subTokens = await llm.tokenize(subChunk.text);
-        results.push({
-          text: subChunk.text,
-          pos: chunk.pos + subChunk.pos,
-          tokens: subTokens.length,
-        });
-      }
-    }
+    await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
   }
 
   return results;
@@ -1578,7 +2848,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display
@@ -1601,8 +2871,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
  * @returns Context string or null if no context is defined
  */
 export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
-  const config = collectionsLoadConfig();
-  const coll = getCollection(collectionName);
+  const coll = getStoreCollection(db, collectionName);
 
   if (!coll) return null;
 
@@ -1610,8 +2879,9 @@ export function getContextForPath(db: Database, collectionName: string, path: st
   const contexts: string[] = [];
 
   // Add global context if present
-  if (config.global_context) {
-    contexts.push(config.global_context);
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    contexts.push(globalCtx);
   }
 
   // Add all matching path contexts (from most general to most specific)
@@ -1642,15 +2912,14 @@ export function getContextForPath(db: Database, collectionName: string, path: st
 
 /**
  * Get context for a file path (virtual or filesystem).
- * Resolves the collection and relative path using the YAML collections config.
+ * Resolves the collection and relative path from the DB store_collections table.
  */
 export function getContextForFile(db: Database, filepath: string): string | null {
   // Handle undefined or null filepath
   if (!filepath) return null;
 
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
-  const config = collectionsLoadConfig();
+  // Get all collections from DB
+  const collections = getStoreCollections(db);
 
   // Parse virtual path format: qmd://collection/path
   let collectionName: string | null = null;
@@ -1679,8 +2948,8 @@ export function getContextForFile(db: Database, filepath: string): string | null
     if (!collectionName || relativePath === null) return null;
   }
 
-  // Get the collection from config
-  const coll = getCollection(collectionName);
+  // Get the collection from DB
+  const coll = getStoreCollection(db, collectionName);
   if (!coll) return null;
 
   // Verify this document exists in the database
@@ -1697,8 +2966,9 @@ export function getContextForFile(db: Database, filepath: string): string | null
   const contexts: string[] = [];
 
   // Add global context if present
-  if (config.global_context) {
-    contexts.push(config.global_context);
+  const globalCtx = getStoreGlobalContext(db);
+  if (globalCtx) {
+    contexts.push(globalCtx);
   }
 
   // Add all matching path contexts (from most general to most specific)
@@ -1728,11 +2998,10 @@ export function getContextForFile(db: Database, filepath: string): string | null
 }
 
 /**
- * Get collection by name from YAML config.
- * Returns collection metadata from ~/.config/qmd/index.yml
+ * Get collection by name from DB store_collections table.
  */
 export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
-  const collection = getCollection(name);
+  const collection = getStoreCollection(db, name);
   if (!collection) return null;
 
   return {
@@ -1744,10 +3013,10 @@ export function getCollectionByName(db: Database, name: string): { name: string;
 
 /**
  * List all collections with document counts from database.
- * Merges YAML config with database statistics.
+ * Merges store_collections config with database statistics.
  */
-export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
-  const collections = collectionsListCollections();
+export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[] {
+  const collections = getStoreCollections(db);
 
   // Get document counts from database for each collection
   const result = collections.map(coll => {
@@ -1767,6 +3036,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
       doc_count: stats?.doc_count || 0,
       active_count: stats?.active_count || 0,
       last_modified: stats?.last_modified || null,
+      includeByDefault: coll.includeByDefault !== false,
     };
   });
 
@@ -1787,8 +3057,8 @@ export function removeCollection(db: Database, collectionName: string): { delete
     WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
   `).run();
 
-  // Remove from YAML config (returns true if found and removed)
-  collectionsRemoveCollection(collectionName);
+  // Remove from store_collections
+  deleteStoreCollection(db, collectionName);
 
   return {
     deletedDocs: docResult.changes,
@@ -1805,8 +3075,8 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
     .run(newName, oldName);
 
-  // Rename in YAML config
-  collectionsRenameCollection(oldName, newName);
+  // Rename in store_collections
+  renameStoreCollection(db, oldName, newName);
 }
 
 // =============================================================================
@@ -1823,8 +3093,8 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
     throw new Error(`Collection with id ${collectionId} not found`);
   }
 
-  // Use collections.ts to add context
-  collectionsAddContext(coll.name, pathPrefix, context);
+  // Add context to store_collections
+  updateStoreContext(db, coll.name, pathPrefix, context);
 }
 
 /**
@@ -1832,8 +3102,8 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
  * Returns the number of contexts deleted.
  */
 export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
-  // Use collections.ts to remove context
-  const success = collectionsRemoveContext(collectionName, pathPrefix);
+  // Remove context from store_collections
+  const success = removeStoreContext(db, collectionName, pathPrefix);
   return success ? 1 : 0;
 }
 
@@ -1845,13 +3115,13 @@ export function deleteGlobalContexts(db: Database): number {
   let deletedCount = 0;
 
   // Remove global context
-  setGlobalContext(undefined);
+  setStoreGlobalContext(db, undefined);
   deletedCount++;
 
   // Remove root context (empty string) from all collections
-  const collections = collectionsListCollections();
+  const collections = getStoreCollections(db);
   for (const coll of collections) {
-    const success = collectionsRemoveContext(coll.name, '');
+    const success = removeStoreContext(db, coll.name, '');
     if (success) {
       deletedCount++;
     }
@@ -1865,7 +3135,7 @@ export function deleteGlobalContexts(db: Database): number {
  * Returns contexts ordered by collection name, then by path prefix length (longest first).
  */
 export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const allContexts = collectionsListAllContexts();
+  const allContexts = getStoreContexts(db);
 
   // Convert to expected format and sort
   return allContexts.map(ctx => ({
@@ -1890,7 +3160,7 @@ export function listPathContexts(db: Database): { collection_name: string; path_
  * Get all collections (name only - from YAML config).
  */
 export function getAllCollections(db: Database): { name: string }[] {
-  const collections = collectionsListCollections();
+  const collections = getStoreCollections(db);
   return collections.map(c => ({ name: c.name }));
 }
 
@@ -1899,13 +3169,13 @@ export function getAllCollections(db: Database): { name: string }[] {
  * Returns collections that have no context entries at all (not even root context).
  */
 export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
-  // Get all collections from YAML config
-  const yamlCollections = collectionsListCollections();
+  // Get all collections from DB
+  const allCollections = getStoreCollections(db);
 
   // Filter to those without context
   const collectionsWithoutContext: { name: string; pwd: string; doc_count: number }[] = [];
 
-  for (const coll of yamlCollections) {
+  for (const coll of allCollections) {
     // Check if collection has any context
     if (!coll.context || Object.keys(coll.context).length === 0) {
       // Get doc count from database
@@ -1937,13 +3207,13 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
     WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
 
-  // Get existing contexts for this collection from YAML
-  const yamlColl = getCollection(collectionName);
-  if (!yamlColl) return [];
+  // Get existing contexts for this collection from DB
+  const dbColl = getStoreCollection(db, collectionName);
+  if (!dbColl) return [];
 
   const contextPrefixes = new Set<string>();
-  if (yamlColl.context) {
-    for (const prefix of Object.keys(yamlColl.context)) {
+  if (dbColl.context) {
+    for (const prefix of Object.keys(dbColl.context)) {
       contextPrefixes.add(prefix);
     }
   }
@@ -1983,8 +3253,46 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+export function sanitizeFTS5Term(term: string): string {
+  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
+}
+
+/**
+ * Check if a token is a hyphenated compound word (e.g., multi-agent, DEC-0054, gpt-4).
+ * Returns true if the token contains internal hyphens between word/digit characters.
+ */
+function isHyphenatedToken(token: string): boolean {
+  return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
+}
+
+/**
+ * Sanitize a hyphenated term into an FTS5 phrase by splitting on hyphens
+ * and sanitizing each part. Returns the parts joined by spaces for use
+ * inside FTS5 quotes: "multi agent" matches "multi-agent" in porter tokenizer.
+ */
+function sanitizeHyphenatedTerm(term: string): string {
+  return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+}
+
+/**
+ * Check if a token is a dotted version/version-like string (e.g., 2026.4.10, 3.14.0).
+ * Returns true if splitting on dots yields at least 2 non-empty parts consisting of
+ * word/digit characters only. This avoids incorrectly splitting tokens with leading/
+ * trailing dots. Version strings like "2026.4.10" split into ["2026","4","10"] (3 parts).
+ */
+function isDottedToken(token: string): boolean {
+  const parts = token.split('.');
+  return parts.length >= 2 && parts.every(p => p.length > 0 && /^[\p{L}\p{N}_]+$/u.test(p));
+}
+
+/**
+ * Sanitize a dotted term into individual FTS5 tokens joined with AND.
+ * e.g. "2026.4.10" → '"2026"* AND "4"* AND "10"*'
+ * The AND ensures all parts must appear, matching how the porter tokenizer
+ * indexes dotted strings.
+ */
+function sanitizeDottedTerm(term: string): string {
+  return term.split('.').map(t => sanitizeFTS5Term(t)).filter(t => t).map(t => `"${t}"*`).join(' AND ');
 }
 
 /**
@@ -1993,14 +3301,23 @@ function sanitizeFTS5Term(term: string): string {
  * Supports:
  * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
  * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - Hyphenated tokens: multi-agent, DEC-0054, gpt-4 → treated as phrases
  * - Plain terms: term → "term"* (prefix match)
  *
  * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
  * So `-term` only works when there are also positive terms.
  *
+ * Hyphen disambiguation: `-sports` at a word boundary is negation, but `multi-agent`
+ * (where `-` is between word characters) is treated as a hyphenated phrase.
+ * When a leading `-` is followed by what looks like a hyphenated compound word
+ * (e.g., `-multi-agent`), the entire token is treated as a negated phrase.
+ *
  * Examples:
  *   performance -sports     → "performance"* NOT "sports"*
  *   "machine learning"      → "machine learning"
+ *   multi-agent memory      → "multi agent" AND "memory"*
+ *   DEC-0054               → "dec 0054"
+ *   -multi-agent            → NOT "multi agent"
  */
 function buildFTS5Query(query: string): string | null {
   const positive: string[] = [];
@@ -2026,7 +3343,7 @@ function buildFTS5Query(query: string): string | null {
       const phrase = s.slice(start, i).trim();
       i++; // skip closing quote
       if (phrase.length > 0) {
-        const sanitized = phrase.split(/\s+/).map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+        const sanitized = sanitizeFTS5Phrase(phrase);
         if (sanitized) {
           const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
           if (negated) {
@@ -2042,13 +3359,55 @@ function buildFTS5Query(query: string): string | null {
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
       const term = s.slice(start, i);
 
-      const sanitized = sanitizeFTS5Term(term);
-      if (sanitized) {
-        const ftsTerm = `"${sanitized}"*`;  // Prefix match
-        if (negated) {
-          negative.push(ftsTerm);
-        } else {
-          positive.push(ftsTerm);
+      // Handle hyphenated tokens: multi-agent, DEC-0054, gpt-4
+      // These get split into phrase queries so FTS5 porter tokenizer matches them.
+      if (isHyphenatedToken(term)) {
+        const sanitized = sanitizeHyphenatedTerm(term);
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // Phrase match (no prefix)
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+          }
+        }
+      } else if (isDottedToken(term)) {
+        // Handle dotted version strings: 2026.4.10, 3.14.0, v1.2.3
+        // The porter tokenizer splits on dots, so the index has individual tokens.
+        // We AND all parts together so the query matches documents containing all parts.
+        const sanitized = sanitizeDottedTerm(term);
+        if (sanitized) {
+          // sanitizeDottedTerm already wraps each part in quotes with prefix match
+          if (negated) {
+            // Wrap multi-token AND expression in parens for NOT negation
+            negative.push(`(${sanitized})`);
+          } else {
+            // Flatten individual AND'd terms into the positive list so they combine
+            // correctly with other terms (avoids double-wrapping in outer AND).
+            for (const part of sanitized.split(' AND ')) {
+              positive.push(part.trim());
+            }
+          }
+        }
+      } else if (containsCjk(term)) {
+        const sanitized = sanitizeFTS5Phrase(term);
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // CJK phrase over character tokens
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+          }
+        }
+      } else {
+        const sanitized = sanitizeFTS5Term(term);
+        if (sanitized) {
+          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          if (negated) {
+            negative.push(ftsTerm);
+          } else {
+            positive.push(ftsTerm);
+          }
         }
       }
     }
@@ -2075,8 +3434,9 @@ function buildFTS5Query(query: string): string | null {
  * Returns error message if invalid, null if valid.
  */
 export function validateSemanticQuery(query: string): string | null {
-  // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  // Check for negation syntax — only at token boundaries (start of string or after whitespace).
+  // Hyphenated words like "real-time" or "write-ahead" must not trigger this.
+  if (/(^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;
@@ -2097,20 +3457,38 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
+  // Use a CTE to force FTS5 to run first, then filter by collection.
+  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
+  // collection filter in a single WHERE clause, which can cause it to
+  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
+  // query into a 17-second query on large collections.
+  const params: (string | number)[] = [ftsQuery];
+
+  // When filtering by collection, fetch extra candidates from the FTS index
+  // since some will be filtered out. Without a collection filter we can
+  // fetch exactly the requested limit.
+  const ftsLimit = collectionName ? limit * 10 : limit;
+
   let sql = `
+    WITH fts_matches AS (
+      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+      FROM documents_fts
+      WHERE documents_fts MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ${ftsLimit}
+    )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
-    FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
+      fm.bm25_score
+    FROM fts_matches fm
+    JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
-    WHERE documents_fts MATCH ? AND d.active = 1
+    WHERE d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
 
   if (collectionName) {
     sql += ` AND d.collection = ?`;
@@ -2118,7 +3496,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   }
 
   // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY bm25_score ASC LIMIT ?`;
+  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
@@ -2198,10 +3576,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
     params.push(collectionName);
   }
 
-  const docRows = db.prepare(docSql).all(...params) as {
+  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
     display_path: string; title: string; body: string;
-  }[];
+  }[]);
 
   // Combine with distances and dedupe by filepath
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
@@ -2240,12 +3618,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
   // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+  const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -2253,29 +3631,100 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
-  return db.prepare(`
+export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    LEFT JOIN (
+      SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+      FROM content_vectors
+      WHERE model = ? AND embed_fingerprint = ?
+      GROUP BY hash, model, embed_fingerprint
+    ) v ON d.hash = v.hash
+    WHERE d.active = 1
+      AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
 }
 
 /**
- * Clear all embeddings from the database (force re-index).
- * Deletes all rows from content_vectors and drops the vectors_vec table.
+ * Clear embeddings for the whole index, or just for one collection.
+ *
+ * When `collection` is omitted the entire content_vectors table is emptied and
+ * the vectors_vec virtual table is dropped (it is recreated with the right
+ * dimensions on the next embed run).
+ *
+ * When `collection` is provided, only vectors whose hash is referenced
+ * exclusively by active documents in that collection are removed. Hashes
+ * shared with active documents in other collections are left in place so
+ * vector search keeps working there (content_vectors is keyed globally by
+ * content hash; identical document bodies across collections share a row).
+ * vectors_vec is preserved so other collections keep working unless the scoped
+ * clear empties content_vectors entirely, in which case it is dropped so the
+ * next embed can recreate the table with the current dimensions.
  */
-export function clearAllEmbeddings(db: Database): void {
-  db.exec(`DELETE FROM content_vectors`);
-  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+export function clearAllEmbeddings(db: Database, collection?: string): void {
+  if (!collection) {
+    db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    return;
+  }
+
+  const exclusiveHashesQuery = `
+    SELECT DISTINCT d.hash
+    FROM documents d
+    WHERE d.collection = ? AND d.active = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM documents d2
+        WHERE d2.hash = d.hash
+          AND d2.active = 1
+          AND d2.collection != d.collection
+      )
+  `;
+
+  const vecTableExists = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
+    .get();
+
+  withLazyContentVectorMigration(db, () => {
+    if (vecTableExists) {
+      const hashSeqRows = db.prepare(`
+        SELECT cv.hash, cv.seq
+        FROM content_vectors cv
+        WHERE cv.hash IN (${exclusiveHashesQuery})
+      `).all(collection) as { hash: string; seq: number }[];
+
+      const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+      for (const row of hashSeqRows) {
+        delVec.run(`${row.hash}_${row.seq}`);
+      }
+    }
+
+    db.prepare(`
+      DELETE FROM content_vectors
+      WHERE hash IN (${exclusiveHashesQuery})
+    `).run(collection);
+
+    const remaining = db
+      .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
+      .get() as { n: number };
+    if (remaining.n === 0) {
+      db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+    }
+  });
 }
 
 /**
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
+ *
+ * content_vectors is inserted first so that getHashesForEmbedding (which checks
+ * only content_vectors) won't re-select the hash on a crash between the two inserts.
+ *
+ * vectors_vec uses DELETE + INSERT instead of INSERT OR REPLACE because sqlite-vec's
+ * vec0 virtual tables silently ignore the OR REPLACE conflict clause.
  */
 export function insertEmbedding(
   db: Database,
@@ -2284,41 +3733,80 @@ export function insertEmbedding(
   pos: number,
   embedding: Float32Array,
   model: string,
-  embeddedAt: string
+  embeddedAt: string,
+  totalChunks: number = 1,
+  fingerprint: string = getEmbeddingFingerprint(model)
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
-  insertVecStmt.run(hashSeq, embedding);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+  withLazyContentVectorMigration(db, () => {
+    // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
+    const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
+
+    // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
+    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+    deleteVecStmt.run(hashSeq);
+    insertVecStmt.run(hashSeq, embedding);
+  });
+}
+
+function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+  return withLazyContentVectorMigration(db, () => {
+    let removed = 0;
+    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
+    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+
+    for (const [hash, expectedChunks] of expectedChunksByHash) {
+      const rows = rowsStmt.all(hash, model) as { seq: number }[];
+      if (rows.length === 0 || rows.length === expectedChunks) continue;
+
+      for (const row of rows) {
+        deleteVecStmt.run(`${hash}_${row.seq}`);
+      }
+      deleteContentStmt.run(hash, model);
+      removed += rows.length;
+    }
+
+    return removed;
+  });
 }
 
 // =============================================================================
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
-      return JSON.parse(cached) as ExpandedQuery[];
+      const parsed = JSON.parse(cached) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      const rows = parsed as Array<Record<string, unknown>>;
+      // Migrate old cache format: { type, text } → { type, query }
+      if (rows.length > 0 && typeof rows[0]?.query === "string") {
+        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.query) }));
+      } else if (rows.length > 0 && typeof rows[0]?.text === "string") {
+        return rows.map((r) => ({ type: r.type as ExpandedQuery["type"], query: String(r.text) }));
+      }
     } catch {
       // Old cache format (pre-typed, newline-separated text) — re-expand
     }
   }
 
-  const llm = getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
   const expanded: ExpandedQuery[] = results
     .filter(r => r.text !== query)
-    .map(r => ({ type: r.type, text: r.text }));
+    .map(r => ({ type: r.type, query: r.text }));
 
   if (expanded.length > 0) {
     setCachedResult(db, cacheKey, JSON.stringify(expanded));
@@ -2331,40 +3819,48 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+  // Prepend intent to rerank query so the reranker scores with domain context
+  const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+
   const cachedResults: Map<string, number> = new Map();
-  const uncachedDocs: RerankDocument[] = [];
+  const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
 
   // Check cache for each document
   // Cache key includes chunk text — different queries can select different chunks
   // from the same file, and the reranker score depends on which chunk was sent.
+  // File path is excluded from the new cache key because the reranker score
+  // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey);
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
-      cachedResults.set(doc.file, parseFloat(cached));
+      cachedResults.set(doc.text, parseFloat(cached));
     } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
+      uncachedDocsByChunk.set(doc.text, { file: doc.file, text: doc.text });
     }
   }
 
   // Rerank uncached documents using LlamaCpp
-  if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
-    const rerankResult = await llm.rerank(query, uncachedDocs, { model });
+  if (uncachedDocsByChunk.size > 0) {
+    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const uncachedDocs = [...uncachedDocsByChunk.values()];
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
-    // Cache results — use original doc.text for cache key (result.file lacks chunk text)
-    const textByFile = new Map(documents.map(d => [d.file, d.text]));
+    // Cache results by chunk text so identical chunks across files are scored once.
+    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
-      const cacheKey = getCacheKey("rerank", { query, file: result.file, model, chunk: textByFile.get(result.file) || "" });
+      const chunk = textByFile.get(result.file) || "";
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(result.file, result.score);
+      cachedResults.set(chunk, result.score);
     }
   }
 
   // Return all results sorted by score
   return documents
-    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.file) || 0 }))
+    .map(doc => ({ file: doc.file, score: cachedResults.get(doc.text) || 0 }))
     .sort((a, b) => b.score - a.score);
 }
 
@@ -2415,6 +3911,72 @@ export function reciprocalRankFusion(
   return Array.from(scores.values())
     .sort((a, b) => b.rrfScore - a.rrfScore)
     .map(e => ({ ...e.result, score: e.rrfScore }));
+}
+
+/**
+ * Build per-document RRF contribution traces for explain/debug output.
+ */
+export function buildRrfTrace(
+  resultLists: RankedResult[][],
+  weights: number[] = [],
+  listMeta: RankedListMeta[] = [],
+  k: number = 60
+): Map<string, RRFScoreTrace> {
+  const traces = new Map<string, RRFScoreTrace>();
+
+  for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
+    const list = resultLists[listIdx];
+    if (!list) continue;
+    const weight = weights[listIdx] ?? 1.0;
+    const meta = listMeta[listIdx] ?? {
+      source: "fts",
+      queryType: "original",
+      query: "",
+    } as const;
+
+    for (let rank0 = 0; rank0 < list.length; rank0++) {
+      const result = list[rank0];
+      if (!result) continue;
+      const rank = rank0 + 1; // 1-indexed rank for explain output
+      const contribution = weight / (k + rank);
+      const existing = traces.get(result.file);
+
+      const detail: RRFContributionTrace = {
+        listIndex: listIdx,
+        source: meta.source,
+        queryType: meta.queryType,
+        query: meta.query,
+        rank,
+        weight,
+        backendScore: result.score,
+        rrfContribution: contribution,
+      };
+
+      if (existing) {
+        existing.baseScore += contribution;
+        existing.topRank = Math.min(existing.topRank, rank);
+        existing.contributions.push(detail);
+      } else {
+        traces.set(result.file, {
+          contributions: [detail],
+          baseScore: contribution,
+          topRank: rank,
+          topRankBonus: 0,
+          totalScore: 0,
+        });
+      }
+    }
+  }
+
+  for (const trace of traces.values()) {
+    let bonus = 0;
+    if (trace.topRank === 1) bonus = 0.05;
+    else if (trace.topRank <= 3) bonus = 0.02;
+    trace.topRankBonus = bonus;
+    trace.totalScore = trace.baseScore + bonus;
+  }
+
+  return traces;
 }
 
 // =============================================================================
@@ -2498,9 +4060,9 @@ export function findDocument(db: Database, filename: string, options: { includeB
     `).get(`%${filepath}`) as DbDocRow | null;
   }
 
-  // Try to match by absolute path (requires looking up collection paths from YAML)
+  // Try to match by absolute path (requires looking up collection paths from DB)
   if (!doc && !filepath.startsWith('qmd://')) {
-    const collections = collectionsListCollections();
+    const collections = getStoreCollections(db);
     for (const coll of collections) {
       let relativePath: string | null = null;
 
@@ -2568,9 +4130,9 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
     `).get(filepath) as { body: string } | null;
   }
 
-  // Try absolute path by looking up in YAML collections
+  // Try absolute path by looking up in DB store_collections
   if (!row) {
-    const collections = collectionsListCollections();
+    const collections = getStoreCollections(db);
     for (const coll of collections) {
       if (filepath.startsWith(coll.path + '/')) {
         const relativePath = filepath.slice(coll.path.length + 1);
@@ -2590,7 +4152,7 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   let body = row.body;
   if (fromLine !== undefined || maxLines !== undefined) {
     const lines = body.split('\n');
-    const start = (fromLine || 1) - 1;
+    const start = Math.max(0, (fromLine || 1) - 1);
     const end = maxLines !== undefined ? start + maxLines : lines.length;
     body = lines.slice(start, end).join('\n');
   }
@@ -2607,7 +4169,7 @@ export function findDocuments(
   pattern: string,
   options: { includeBody?: boolean; maxBytes?: number } = {}
 ): { docs: MultiGetResult[]; errors: string[] } {
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
   const errors: string[] = [];
   const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
 
@@ -2712,26 +4274,30 @@ export function findDocuments(
 // Status
 // =============================================================================
 
-export function getStatus(db: Database): IndexStatus {
-  // Load collections from YAML
-  const yamlCollections = collectionsListCollections();
+export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexStatus {
+  // DB is source of truth for collections — config provides supplementary metadata
+  const dbCollections = db.prepare(`
+    SELECT
+      collection as name,
+      COUNT(*) as active_count,
+      MAX(modified_at) as last_doc_update
+    FROM documents
+    WHERE active = 1
+    GROUP BY collection
+  `).all() as { name: string; active_count: number; last_doc_update: string | null }[];
 
-  // Get document counts and last update times for each collection
-  const collections = yamlCollections.map(col => {
-    const stats = db.prepare(`
-      SELECT
-        COUNT(*) as active_count,
-        MAX(modified_at) as last_doc_update
-      FROM documents
-      WHERE collection = ? AND active = 1
-    `).get(col.name) as { active_count: number; last_doc_update: string | null };
+  // Build a lookup from store_collections for path/pattern metadata
+  const storeCollections = getStoreCollections(db);
+  const configLookup = new Map(storeCollections.map(c => [c.name, { path: c.path, pattern: c.pattern }]));
 
+  const collections: CollectionInfo[] = dbCollections.map(row => {
+    const config = configLookup.get(row.name);
     return {
-      name: col.name,
-      path: col.path,
-      pattern: col.pattern,
-      documents: stats.active_count,
-      lastUpdated: stats.last_doc_update || new Date().toISOString(),
+      name: row.name,
+      path: config?.path ?? null,
+      pattern: config?.pattern ?? null,
+      documents: row.active_count,
+      lastUpdated: row.last_doc_update || new Date().toISOString(),
     };
   });
 
@@ -2743,7 +4309,7 @@ export function getStatus(db: Database): IndexStatus {
   });
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   return {
@@ -2766,12 +4332,50 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
+/** Weight for intent terms relative to query terms (1.0) in snippet scoring */
+export const INTENT_WEIGHT_SNIPPET = 0.3;
+
+/** Weight for intent terms relative to query terms (1.0) in chunk selection */
+export const INTENT_WEIGHT_CHUNK = 0.5;
+
+// Common stop words filtered from intent strings before tokenization.
+// Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
+// 2-3 char function words so the length threshold can drop to >1 and let
+// short domain terms (API, SQL, LLM, CPU, CDN, …) survive.
+const INTENT_STOP_WORDS = new Set([
+  // 2-char function words
+  "am", "an", "as", "at", "be", "by", "do", "he", "if",
+  "in", "is", "it", "me", "my", "no", "of", "on", "or", "so",
+  "to", "up", "us", "we",
+  // 3-char function words
+  "all", "and", "any", "are", "but", "can", "did", "for", "get",
+  "has", "her", "him", "his", "how", "its", "let", "may", "not",
+  "our", "out", "the", "too", "was", "who", "why", "you",
+  // 4+ char common words
+  "also", "does", "find", "from", "have", "into", "more", "need",
+  "show", "some", "tell", "that", "them", "this", "want", "what",
+  "when", "will", "with", "your",
+  // Search-context noise
+  "about", "looking", "notes", "search", "where", "which",
+]);
+
+/**
+ * Extract meaningful terms from an intent string, filtering stop words and punctuation.
+ * Uses Unicode-aware punctuation stripping so domain terms like "API" survive.
+ * Returns lowercase terms suitable for text matching.
+ */
+export function extractIntentTerms(intent: string): string[] {
+  return intent.toLowerCase().split(/\s+/)
+    .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
+}
+
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
 
-  if (chunkPos && chunkPos > 0) {
+  if (chunkPos !== undefined && chunkPos >= 0) {
     // Search within the chunk region, with some padding for context
     // Use provided chunkLen or fall back to max chunk size (covers variable-length chunks)
     const searchLen = chunkLen || CHUNK_SIZE_CHARS;
@@ -2785,18 +4389,39 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   const lines = searchBody.split('\n');
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const lineLower = (lines[i] ?? "").toLowerCase();
     let score = 0;
     for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
+      if (lineLower.includes(term)) score += 1.0;
+    }
+    for (const term of intentTerms) {
+      if (lineLower.includes(term)) score += INTENT_WEIGHT_SNIPPET;
     }
     if (score > bestScore) {
       bestScore = score;
       bestLine = i;
     }
+  }
+
+  if (chunkPos !== undefined && chunkPos >= 0 && bestScore <= 0) {
+    if (chunkPos === 0) {
+      // chunkPos=0 may be the chunk selector's initialization default for queries
+      // where lexical chunk scoring found no winner (e.g. tokens filtered to empty
+      // by the length>2 guard). Retry with full body so the real match isn't missed.
+      return extractSnippet(body, query, maxLen, undefined, undefined, intent);
+    }
+    // For chunkPos > 0 the reranker actively picked this chunk. Tokens failing to
+    // match literally is most likely a tokenizer limitation (quoted phrases, FTS5
+    // syntax, HYDE passages, semantic hits), so anchor on the chunk start rather
+    // than disregarding the reranker's pick.
+    const contextStart = Math.max(0, chunkPos - 100);
+    bestLine = chunkPos > contextStart
+      ? searchBody.slice(0, chunkPos - contextStart).split('\n').length - 1
+      : 0;
   }
 
   const start = Math.max(0, bestLine - 1);
@@ -2807,7 +4432,7 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
   if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+    return extractSnippet(body, query, maxLen, undefined, undefined, intent);
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
@@ -2878,6 +4503,10 @@ export interface HybridQueryOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
+  explain?: boolean;        // include backend/RRF/rerank score traces
+  intent?: string;          // domain intent hint for disambiguation
+  skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -2891,6 +4520,28 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  explain?: HybridQueryExplain;
+}
+
+export type RankedListMeta = {
+  source: "fts" | "vec";
+  queryType: "original" | "lex" | "vec" | "hyde";
+  query: string;
+};
+
+/**
+ * RRF list weights for hybridQuery.
+ *
+ * Original-query retrieval paths are the primary evidence and get 2x weight:
+ * - original FTS
+ * - original vector search
+ *
+ * Expansion-derived lists (lex/vec/hyde) stay at 1x regardless of list order,
+ * so a lex expansion inserted before original vector search cannot steal the
+ * original vector boost.
+ */
+export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
+  return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
 /**
@@ -2915,20 +4566,27 @@ export async function hybridQuery(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
+  const explain = options?.explain ?? false;
+  const intent = options?.intent;
+  const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
+  const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
+  // When intent is provided, disable strong-signal bypass — the obvious BM25
+  // match may not be what the caller wants (e.g. "performance" with intent
+  // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
   const initialFts = store.searchFTS(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = initialFts.length > 0
+  const hasStrongSignal = !intent && initialFts.length > 0
     && topScore >= STRONG_SIGNAL_MIN_SCORE
     && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
 
@@ -2939,7 +4597,7 @@ export async function hybridQuery(
   const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query);
+    : await store.expandQuery(query, undefined, intent);
 
   hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
@@ -2950,6 +4608,7 @@ export async function hybridQuery(
       file: r.filepath, displayPath: r.displayPath,
       title: r.title, body: r.body || "", score: r.score,
     })));
+    rankedListMeta.push({ source: "fts", queryType: "original", query });
   }
 
   // Step 3: Route searches by query type
@@ -2961,31 +4620,33 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.text, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
+        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
     }
   }
 
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
   if (hasVectors) {
-    const vecQueries: { text: string; isOriginal: boolean }[] = [
-      { text: query, isOriginal: true },
+    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
+      { text: query, queryType: "original" },
     ];
     for (const q of expanded) {
       if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.text, isOriginal: false });
+        vecQueries.push({ text: q.query, queryType: q.type });
       }
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getDefaultLlamaCpp();
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const llm = getLlm(store);
+    const embedModel = llm.embedModelName;
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
@@ -2997,7 +4658,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecQueries[i]!.text, embedModel, 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -3006,13 +4667,20 @@ export async function hybridQuery(
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
         })));
+        rankedListMeta.push({
+          source: "vec",
+          queryType: vecQueries[i]!.queryType,
+          query: vecQueries[i]!.text,
+        });
       }
     }
   }
 
-  // Step 4: RRF fusion — first 2 lists (original FTS + first vec) get 2x weight
-  const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+  // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
+  // expansion-derived lists stay at 1x independent of insertion order.
+  const weights = getHybridRrfWeights(rankedListMeta);
   const fused = reciprocalRankFusion(rankedLists, weights);
+  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -3020,30 +4688,92 @@ export async function hybridQuery(
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const chunksToRerank: { file: string; text: string }[] = [];
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
+  const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
-    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
 
+  if (skipRerank) {
+    // Skip LLM reranking — return candidates scored by RRF only
+    const seenFiles = new Set<string>();
+    return candidates
+      .map((cand, i) => {
+        const chunkInfo = docChunkMap.get(cand.file);
+        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const rrfRank = i + 1;
+        const rrfScore = 1 / rrfRank;
+        const trace = rrfTraceByFile?.get(cand.file);
+        const explainData: HybridQueryExplain | undefined = explain ? {
+          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          rrf: {
+            rank: rrfRank,
+            positionScore: rrfScore,
+            weight: 1.0,
+            baseScore: trace?.baseScore ?? 0,
+            topRankBonus: trace?.topRankBonus ?? 0,
+            totalScore: trace?.totalScore ?? 0,
+            contributions: trace?.contributions ?? [],
+          },
+          rerankScore: 0,
+          blendedScore: rrfScore,
+        } : undefined;
+
+        return {
+          file: cand.file,
+          displayPath: cand.displayPath,
+          title: cand.title,
+          body: cand.body,
+          bestChunk,
+          bestChunkPos,
+          score: rrfScore,
+          context: store.getContextForFile(cand.file),
+          docid: docidMap.get(cand.file) || "",
+          ...(explainData ? { explain: explainData } : {}),
+        };
+      })
+      .filter(r => {
+        if (seenFiles.has(r.file)) return false;
+        seenFiles.add(r.file);
+        return true;
+      })
+      .filter(r => r.score >= minScore)
+      .slice(0, limit);
+  }
+
   // Step 6: Rerank chunks (NOT full bodies)
+  const chunksToRerank: { file: string; text: string }[] = [];
+  for (const cand of candidates) {
+    const chunkInfo = docChunkMap.get(cand.file);
+    if (chunkInfo) {
+      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    }
+  }
+
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -3067,6 +4797,22 @@ export async function hybridQuery(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const trace = rrfTraceByFile?.get(r.file);
+    const explainData: HybridQueryExplain | undefined = explain ? {
+      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      rrf: {
+        rank: rrfRank,
+        positionScore: rrfScore,
+        weight: rrfWeight,
+        baseScore: trace?.baseScore ?? 0,
+        topRankBonus: trace?.topRankBonus ?? 0,
+        totalScore: trace?.totalScore ?? 0,
+        contributions: trace?.contributions ?? [],
+      },
+      rerankScore: r.score,
+      blendedScore,
+    } : undefined;
 
     return {
       file: r.file,
@@ -3078,6 +4824,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
 
@@ -3097,6 +4844,7 @@ export interface VectorSearchOptions {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
+  intent?: string;          // domain intent hint for disambiguation
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -3127,6 +4875,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3135,15 +4884,16 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = await store.expandQuery(query, undefined, intent);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const queryTexts = [query, ...vecExpanded.map(q => q.text)];
+  const embedModel = getLlm(store).embedModelName;
+  const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -3174,22 +4924,17 @@ export async function vectorSearchQuery(
  * A single sub-search in a structured search request.
  * Matches the format used in QMD training data.
  */
-export interface StructuredSubSearch {
-  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical */
-  type: 'lex' | 'vec' | 'hyde';
-  /** The search query text */
-  query: string;
-  /** Optional line number for error reporting (CLI parser) */
-  line?: number;
-}
-
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
-  /** Future: domain intent hint for routing/boosting */
+  explain?: boolean;        // include backend/RRF/rerank score traces
+  /** Domain intent hint for disambiguation — steers reranking and chunk selection */
   intent?: string;
+  /** Skip LLM reranking, use only RRF scores */
+  skipRerank?: boolean;
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -3213,12 +4958,15 @@ export interface StructuredSearchOptions {
  */
 export async function structuredSearch(
   store: Store,
-  searches: StructuredSubSearch[],
+  searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const explain = options?.explain ?? false;
+  const intent = options?.intent;
+  const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -3245,6 +4993,7 @@ export async function structuredSearch(
   }
 
   const rankedLists: RankedResult[][] = [];
+  const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3264,6 +5013,11 @@ export async function structuredSearch(
             file: r.filepath, displayPath: r.displayPath,
             title: r.title, body: r.body || "", score: r.score,
           })));
+          rankedListMeta.push({
+            source: "fts",
+            queryType: "lex",
+            query: search.query,
+          });
         }
       }
     }
@@ -3271,10 +5025,14 @@ export async function structuredSearch(
 
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
-    const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
+    const vecSearches = searches.filter(
+      (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
+        s.type === 'vec' || s.type === 'hyde'
+    );
     if (vecSearches.length > 0) {
-      const llm = getDefaultLlamaCpp();
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const llm = getLlm(store);
+      const embedModel = llm.embedModelName;
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
@@ -3286,7 +5044,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            vecSearches[i]!.query, embedModel, 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {
@@ -3295,6 +5053,11 @@ export async function structuredSearch(
               file: r.filepath, displayPath: r.displayPath,
               title: r.title, body: r.body || "", score: r.score,
             })));
+            rankedListMeta.push({
+              source: "vec",
+              queryType: vecSearches[i]!.type,
+              query: vecSearches[i]!.query,
+            });
           }
         }
       }
@@ -3306,6 +5069,7 @@ export async function structuredSearch(
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
+  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -3318,30 +5082,92 @@ export async function structuredSearch(
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const chunksToRerank: { file: string; text: string }[] = [];
+  const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
     let bestIdx = 0;
     let bestScore = -1;
     for (let i = 0; i < chunks.length; i++) {
       const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
 
-    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
 
+  if (skipRerank) {
+    // Skip LLM reranking — return candidates scored by RRF only
+    const seenFiles = new Set<string>();
+    return candidates
+      .map((cand, i) => {
+        const chunkInfo = docChunkMap.get(cand.file);
+        const bestIdx = chunkInfo?.bestIdx ?? 0;
+        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
+        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const rrfRank = i + 1;
+        const rrfScore = 1 / rrfRank;
+        const trace = rrfTraceByFile?.get(cand.file);
+        const explainData: HybridQueryExplain | undefined = explain ? {
+          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+          rrf: {
+            rank: rrfRank,
+            positionScore: rrfScore,
+            weight: 1.0,
+            baseScore: trace?.baseScore ?? 0,
+            topRankBonus: trace?.topRankBonus ?? 0,
+            totalScore: trace?.totalScore ?? 0,
+            contributions: trace?.contributions ?? [],
+          },
+          rerankScore: 0,
+          blendedScore: rrfScore,
+        } : undefined;
+
+        return {
+          file: cand.file,
+          displayPath: cand.displayPath,
+          title: cand.title,
+          body: cand.body,
+          bestChunk,
+          bestChunkPos,
+          score: rrfScore,
+          context: store.getContextForFile(cand.file),
+          docid: docidMap.get(cand.file) || "",
+          ...(explainData ? { explain: explainData } : {}),
+        };
+      })
+      .filter(r => {
+        if (seenFiles.has(r.file)) return false;
+        seenFiles.add(r.file);
+        return true;
+      })
+      .filter(r => r.score >= minScore)
+      .slice(0, limit);
+  }
+
   // Step 5: Rerank chunks
+  const chunksToRerank: { file: string; text: string }[] = [];
+  for (const cand of candidates) {
+    const chunkInfo = docChunkMap.get(cand.file);
+    if (chunkInfo) {
+      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    }
+  }
+
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -3364,6 +5190,22 @@ export async function structuredSearch(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const trace = rrfTraceByFile?.get(r.file);
+    const explainData: HybridQueryExplain | undefined = explain ? {
+      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+      rrf: {
+        rank: rrfRank,
+        positionScore: rrfScore,
+        weight: rrfWeight,
+        baseScore: trace?.baseScore ?? 0,
+        topRankBonus: trace?.topRankBonus ?? 0,
+        totalScore: trace?.totalScore ?? 0,
+        contributions: trace?.contributions ?? [],
+      },
+      rerankScore: r.score,
+      blendedScore,
+    } : undefined;
 
     return {
       file: r.file,
@@ -3375,6 +5217,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
 

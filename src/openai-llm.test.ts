@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
-import { OpenAILLM } from "./openai-llm";
+import { OpenAILLM } from "./openai-llm.js";
 
 // Save and restore env
 const originalEnv = { ...process.env };

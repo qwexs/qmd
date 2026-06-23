@@ -29,6 +29,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
+# Verify bun.lock is in sync with package.json
+if ! bun install --frozen-lockfile &>/dev/null; then
+  echo "Error: bun.lock is out of sync with package.json" >&2
+  echo "Run 'bun install' and commit the updated lockfile." >&2
+  exit 1
+fi
+echo "bun.lock: in sync ✓"
+
 # Read current version
 CURRENT=$(jq -r .version package.json)
 echo "Current version: $CURRENT"
@@ -85,7 +93,7 @@ echo ""
 
 # --- Rename [Unreleased] -> [X.Y.Z] - date, add fresh [Unreleased] ---
 
-sed -i '' "s/^## \[Unreleased\].*/## [$NEW] - $DATE/" CHANGELOG.md
+perl -0pi -e 's/^## \[Unreleased\].*/## ['"$NEW"'] - '"$DATE"'/m' CHANGELOG.md
 
 # Insert a new empty [Unreleased] section after the header
 awk '
