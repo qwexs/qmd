@@ -28,6 +28,28 @@ let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
 async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
   nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
     () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
+  ).then(
+    (m) => m,
+    (err: unknown) => {
+      // node-llama-cpp is an optional dependency in this fork. Reset the
+      // memo slot so the next call retries, and surface an actionable
+      // error instead of the raw MODULE_NOT_FOUND.
+      nodeLlamaCppImport = null;
+      if (err instanceof Error && /Cannot find module 'node-llama-cpp'/.test(err.message)) {
+        throw new Error(
+          "Local LLM backend requested, but 'node-llama-cpp' is not installed.\n" +
+          "This fork treats node-llama-cpp as an optional dependency to keep the install light for cloud-only users.\n\n" +
+          "Pick one of:\n" +
+          "  1. Use a cloud provider (no native build, no GPU):\n" +
+          "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
+          "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
+          "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
+          "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
+          "       (requires a working C++ toolchain on your platform)"
+        );
+      }
+      throw err;
+    }
   );
   return nodeLlamaCppImport;
 }
@@ -2079,6 +2101,26 @@ export function getDefaultLlamaCpp(): LlamaCpp {
     return defaultLlamaCpp;
   }
   if (!defaultLlamaCpp) {
+    // node-llama-cpp is an optional dependency in this fork (it brings in a
+    // ~hundreds-of-MB native build). If the user did not opt into a cloud
+    // provider and node-llama-cpp is not installed, fail fast with an
+    // actionable message instead of crashing later with MODULE_NOT_FOUND.
+    try {
+      _require.resolve("node-llama-cpp");
+    } catch {
+      throw new Error(
+        "Local LLM backend requested, but 'node-llama-cpp' is not installed.\n" +
+        "This fork treats node-llama-cpp as an optional dependency to keep " +
+        "the install light for cloud-only users.\n\n" +
+        "Pick one of:\n" +
+        "  1. Use a cloud provider (no native build, no GPU):\n" +
+        "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
+        "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
+        "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
+        "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
+        "       (requires a working C++ toolchain on your platform)"
+      );
+    }
     defaultLlamaCpp = new LlamaCpp();
   }
   return defaultLlamaCpp;

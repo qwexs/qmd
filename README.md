@@ -1012,6 +1012,15 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 This fork adds two cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
 
+#### Install without native build (Ubuntu / Windows, cloud-only)
+
+`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
+
+```sh
+bun add node-llama-cpp   # or: npm install node-llama-cpp
+# (requires a working C++ toolchain on your platform)
+```
+
 #### Jina AI (`QMD_LLM_PROVIDER=jina`)
 
 Use [Jina AI](https://jina.ai/) cloud APIs for embeddings and reranking. Query expansion is skipped (not supported by Jina).

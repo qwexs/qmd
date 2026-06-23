@@ -138,11 +138,32 @@ function getStore(): ReturnType<typeof createStore> {
       // getDefaultLlamaCpp() will lazily build the cloud LLM (JinaLLM /
       // OpenAILLM) from the same singleton slot, configured via env vars.
       if (process.env.QMD_LLM_PROVIDER !== 'jina' && process.env.QMD_LLM_PROVIDER !== 'openai') {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: activeModels.embed,
-          generateModel: activeModels.generate,
-          rerankModel: activeModels.rerank,
-        }));
+        try {
+          setDefaultLlamaCpp(new LlamaCpp({
+            embedModel: activeModels.embed,
+            generateModel: activeModels.generate,
+            rerankModel: activeModels.rerank,
+          }));
+        } catch (err) {
+          // node-llama-cpp is an optional dependency in this fork. If the
+          // user did not opt into a cloud provider and node-llama-cpp is
+          // not installed, surface an actionable error instead of the raw
+          // MODULE_NOT_FOUND from the dynamic import.
+          if (err instanceof Error && /Cannot find package 'node-llama-cpp'/.test(err.message)) {
+            throw new Error(
+              "Local LLM backend requested, but 'node-llama-cpp' is not installed.\n" +
+              "This fork treats node-llama-cpp as an optional dependency to keep the install light for cloud-only users.\n\n" +
+              "Pick one of:\n" +
+              "  1. Use a cloud provider (no native build, no GPU):\n" +
+              "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
+              "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
+              "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
+              "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
+              "       (requires a working C++ toolchain on your platform)"
+            );
+          }
+          throw err;
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
