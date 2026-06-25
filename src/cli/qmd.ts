@@ -136,8 +136,12 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
       // Skip local LlamaCpp construction when a cloud provider is active —
       // getDefaultLlamaCpp() will lazily build the cloud LLM (JinaLLM /
-      // OpenAILLM) from the same singleton slot, configured via env vars.
-      if (process.env.QMD_LLM_PROVIDER !== 'jina' && process.env.QMD_LLM_PROVIDER !== 'openai') {
+      // OpenAILLM / OllamaLLM) from the same singleton slot, configured via env vars.
+      if (
+        process.env.QMD_LLM_PROVIDER !== 'jina' &&
+        process.env.QMD_LLM_PROVIDER !== 'openai' &&
+        process.env.QMD_LLM_PROVIDER !== 'ollama'
+      ) {
         try {
           setDefaultLlamaCpp(new LlamaCpp({
             embedModel: activeModels.embed,
@@ -157,6 +161,7 @@ function getStore(): ReturnType<typeof createStore> {
               "  1. Use a cloud provider (no native build, no GPU):\n" +
               "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
               "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
+              "       QMD_LLM_PROVIDER=ollama  OLLAMA_API_KEY=***  qmd ...\n" +
               "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
               "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
               "       (requires a working C++ toolchain on your platform)"
