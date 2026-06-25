@@ -96,6 +96,7 @@ export OLLAMA_EMBED_DIMENSIONS=                # default — model decides (nomi
 
 # Self-hosted Ollama: same provider, point at your local instance
 # export OLLAMA_BASE_URL=http://localhost:11434
+# (then `ollama pull nomic-embed-text` or any other embed model)
 ```
 
 Ollama is search-only: embeddings via `/api/embed`, reranking via cosine
@@ -1104,6 +1105,33 @@ qmd query "deployment process"
 > for the lexical/vector/hyde expansion slots (no LLM-generated variations).
 > Use the structured `qmd query $'intent:... lex:... vec:... hyde:...'` form
 > when you need to control expansion manually.
+
+#### Self-hosted Ollama (zero-cost, fully offline)
+
+The same `QMD_LLM_PROVIDER=ollama` provider works against a self-hosted
+[Ollama](https://ollama.com/) instance. No API key, no Cloud quota, no data
+leaving your machine. Useful for air-gapped setups, free-tier workarounds,
+or simply keeping embeddings local.
+
+```sh
+# 1. Start Ollama (default port 11434)
+ollama serve
+
+# 2. Pull an embed model. nomic-embed-text is the QMD default, but any
+#    embedding-capable model works (bge-m3, mxbai-embed-large, etc.).
+ollama pull nomic-embed-text   # ~274MB
+
+# 3. Point QMD at the local instance
+export QMD_LLM_PROVIDER=ollama
+export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_API_KEY=ignored   # any non-empty string; not checked locally
+qmd embed
+qmd query "deployment process"
+```
+
+If the configured `OLLAMA_EMBED_MODEL` is not present locally, QMD will
+surface the upstream 404 from `/api/embed` ("model ... not found, try
+pulling it first") — run `ollama pull <model>` to fix.
 
 ## How It Works
 
