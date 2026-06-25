@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `QMD_LLM_PROVIDER=ollama` — Ollama Cloud API backend (`https://ollama.com`).
+  Embeddings via `/api/embed`, reranking via cosine similarity over those
+  embeddings (Ollama does not expose a native `/api/rerank` endpoint).
+  Query expansion is skipped (no `generate` model), matching Jina's surface.
+  Works against self-hosted Ollama too — set `OLLAMA_BASE_URL` to point at
+  the local instance. See README for the full env-var reference
+  (`OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL`,
+  `OLLAMA_EMBED_DIMENSIONS`, `OLLAMA_PROXY_URL`).
+
 ### Documentation
 
 - README: documented collection filtering (`-c` semantics), the `collection

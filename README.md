@@ -84,6 +84,25 @@ export JINA_RERANK_MODEL=jina-reranker-v2-base-multilingual     # default
 export JINA_EMBED_DIMENSIONS=1024                               # default
 ```
 
+**Ollama Cloud:**
+
+```sh
+export QMD_LLM_PROVIDER=ollama
+export OLLAMA_API_KEY=ollama_xxxxxxxxxxxx       # from https://ollama.com/settings/keys
+
+# Optional: customize embed model
+export OLLAMA_EMBED_MODEL=nomic-embed-text      # default
+export OLLAMA_EMBED_DIMENSIONS=                # default — model decides (nomic = 768)
+
+# Self-hosted Ollama: same provider, point at your local instance
+# export OLLAMA_BASE_URL=http://localhost:11434
+# (then `ollama pull nomic-embed-text` or any other embed model)
+```
+
+Ollama is search-only: embeddings via `/api/embed`, reranking via cosine
+similarity over those embeddings (no native `/api/rerank` in the Ollama API).
+Query expansion is skipped (no `generate` model), matching Jina's surface.
+
 > Without `QMD_LLM_PROVIDER`, QMD downloads ~2GB of GGUF models on first run and uses them locally. Set the variable to skip local models entirely.
 >
 > See [Environment Variables](#environment-variables) for the full reference.
@@ -1006,15 +1025,15 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
-| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina` or `openai`. When unset, QMD uses local GGUF models via node-llama-cpp |
+| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina`, `openai`, or `ollama`. When unset, QMD uses local GGUF models via node-llama-cpp |
 
 ### Cloud Providers (fork feature — no local GPU required)
 
-This fork adds two cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
+This fork adds three cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
 
 #### Install without native build (Ubuntu / Windows, cloud-only)
 
-`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
+`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`, or `=ollama`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
 
 ```sh
 bun add node-llama-cpp   # or: npm install node-llama-cpp
@@ -1056,6 +1075,63 @@ export OPENAI_API_KEY=sk-proj-xxxxxxxxxxxx
 ```
 
 > **Tip:** Set `OPENAI_BASE_URL` to use any OpenAI-compatible API (e.g., Azure OpenAI, local vLLM, LiteLLM).
+
+#### Ollama Cloud (`QMD_LLM_PROVIDER=ollama`)
+
+Use the [Ollama Cloud](https://ollama.com/cloud) REST API for embeddings.
+Reranking uses cosine similarity over those embeddings (Ollama does not
+expose a native rerank endpoint). Query expansion is skipped (no `generate`
+model), matching Jina's surface.
+
+The same provider also works against a self-hosted Ollama instance — set
+`OLLAMA_BASE_URL` to point at it. No code change required.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_API_KEY` | — | **Required.** Ollama API key from [ollama.com/settings/keys](https://ollama.com/settings/keys) |
+| `OLLAMA_BASE_URL` | `https://ollama.com` | Base URL. Override with `http://localhost:11434` for self-hosted Ollama |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model. Other options: `mxbai-embed-large`, `embeddinggemma`, `qwen3-embedding:0.6b` |
+| `OLLAMA_EMBED_DIMENSIONS` | *(model default)* | Override embedding dimensions if the model supports it (e.g. `256`, `512`) |
+| `OLLAMA_PROXY_URL` | — | HTTP proxy URL |
+
+```sh
+export QMD_LLM_PROVIDER=ollama
+export OLLAMA_API_KEY=ollama_xxxxxxxxxxxx
+qmd embed
+qmd query "deployment process"
+```
+
+> **Note:** Search-only provider — `qmd query` falls back to the original query
+> for the lexical/vector/hyde expansion slots (no LLM-generated variations).
+> Use the structured `qmd query $'intent:... lex:... vec:... hyde:...'` form
+> when you need to control expansion manually.
+
+#### Self-hosted Ollama (zero-cost, fully offline)
+
+The same `QMD_LLM_PROVIDER=ollama` provider works against a self-hosted
+[Ollama](https://ollama.com/) instance. No API key, no Cloud quota, no data
+leaving your machine. Useful for air-gapped setups, free-tier workarounds,
+or simply keeping embeddings local.
+
+```sh
+# 1. Start Ollama (default port 11434)
+ollama serve
+
+# 2. Pull an embed model. nomic-embed-text is the QMD default, but any
+#    embedding-capable model works (bge-m3, mxbai-embed-large, etc.).
+ollama pull nomic-embed-text   # ~274MB
+
+# 3. Point QMD at the local instance
+export QMD_LLM_PROVIDER=ollama
+export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_API_KEY=ignored   # any non-empty string; not checked locally
+qmd embed
+qmd query "deployment process"
+```
+
+If the configured `OLLAMA_EMBED_MODEL` is not present locally, QMD will
+surface the upstream 404 from `/api/embed` ("model ... not found, try
+pulling it first") — run `ollama pull <model>` to fix.
 
 ## How It Works
 
