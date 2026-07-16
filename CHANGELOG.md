@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.6.3-fork.1] - 2026-07-16
+
+Fork sync with upstream tobi/qmd v2.6.3 (HEAD 62b3a67..upstream/main, 15 non-merge
+commits + version bump applied). Preserves fork-specific changes from the
+`feature/ollama-cloud-provider` series (Ollama Cloud backend, optional
+`node-llama-cpp` dependency, fail-fast error for cloud users without
+`node-llama-cpp`).
+
 ### Added
 
 - `QMD_LLM_PROVIDER=ollama` — Ollama Cloud API backend (`https://ollama.com`).
