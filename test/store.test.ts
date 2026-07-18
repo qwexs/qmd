@@ -56,6 +56,7 @@ import {
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
+  searchVec,
   structuredSearch,
   vectorSearchQuery,
   type Store,
@@ -2730,6 +2731,112 @@ describe("Vector Table", () => {
   });
 });
 
+describe("Scoped vector search", () => {
+  test("widens global KNN candidates instead of returning false-empty for a sparse collection", async () => {
+    const store = await createTestStore();
+    const distractors = await createTestCollection({ name: "distractors", pwd: "/test/distractors" });
+    const target = await createTestCollection({ name: "target", pwd: "/test/target" });
+
+    try {
+      store.ensureVecTable(3);
+      const now = new Date().toISOString();
+
+      const insertVectorDocument = async (
+        collection: string,
+        hash: string,
+        embedding: number[],
+      ) => {
+        await insertTestDocument(store.db, collection, {
+          name: hash,
+          hash,
+          body: `# ${hash}\n\nVector fixture`,
+        });
+        store.db.prepare(`
+          INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+          VALUES (?, 0, 0, 'test', ?)
+        `).run(hash, now);
+        store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+          .run(`${hash}_0`, new Float32Array(embedding));
+      };
+
+      // limit=1 starts with k=3. All three nearest neighbours belong to the
+      // distractor collection; the target is only visible after widening k.
+      await insertVectorDocument(distractors, "near1", [1, 0.001, 0]);
+      await insertVectorDocument(distractors, "near2", [1, 0.002, 0]);
+      await insertVectorDocument(distractors, "near3", [1, 0.003, 0]);
+      await insertVectorDocument(distractors, "near4", [1, 0.004, 0]);
+      await insertVectorDocument(target, "target1", [0.7, 0.3, 0]);
+
+      const results = await searchVec(
+        store.db,
+        "ignored because embedding is precomputed",
+        "test",
+        1,
+        target,
+        undefined,
+        [1, 0, 0],
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.collectionName).toBe(target);
+      expect(results[0]!.filepath).toContain("target1.md");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("falls back to exact scoped scoring beyond sqlite-vec's k=4096 cap", async () => {
+    const store = await createTestStore();
+    const target = await createTestCollection({ name: "target-cap", pwd: "/test/target-cap" });
+
+    try {
+      store.ensureVecTable(3);
+      const insertVector = store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+      store.db.exec("BEGIN");
+      try {
+        for (let i = 0; i < 4096; i++) {
+          insertVector.run(`distractor-${i}`, new Float32Array([1, i / 1_000_000, 0]));
+        }
+        store.db.exec("COMMIT");
+      } catch (error) {
+        store.db.exec("ROLLBACK");
+        throw error;
+      }
+
+      const hash = "target-beyond-cap";
+      await insertTestDocument(store.db, target, {
+        name: hash,
+        hash,
+        body: "# Target\n\nSparse collection result",
+      });
+      store.db.prepare(`
+        INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+        VALUES (?, 0, 0, 'test', ?)
+      `).run(hash, new Date().toISOString());
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(
+        `${hash}_0`,
+        new Float32Array([-1, 0, 0]),
+      );
+
+      const results = await searchVec(
+        store.db,
+        "ignored because embedding is precomputed",
+        "test",
+        1,
+        target,
+        undefined,
+        [1, 0, 0],
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.collectionName).toBe(target);
+      expect(results[0]!.filepath).toContain("target-beyond-cap.md");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  }, 60000);
+});
+
 // =============================================================================
 // Integration Tests
 // =============================================================================
@@ -3502,6 +3609,51 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("vectorSearchQuery searches each requested collection before truncating results", async () => {
+    const store = await createTestStore();
+    const model = "fake-embed-model";
+    const targetResult: SearchResult = {
+      filepath: "qmd://main/engram.md",
+      displayPath: "main/engram.md",
+      title: "Engram",
+      hash: "abcdef123456",
+      docid: "abcdef",
+      collectionName: "main",
+      modifiedAt: "",
+      bodyLength: 20,
+      body: "Engram memory system",
+      context: null,
+      score: 0.8,
+      source: "vec",
+      chunkPos: 0,
+    };
+    const searchVecSpy = vi.fn(async (
+      _query: string,
+      _model: string,
+      _limit?: number,
+      collection?: string,
+    ) => collection === "main" ? [targetResult] : []) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: model } as any;
+    store.searchVec = searchVecSpy;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      const results = await vectorSearchQuery(store, "engram память workspace", {
+        collections: ["life", "main"],
+        limit: 1,
+        minScore: 0,
+      });
+
+      expect(searchVecSpy).toHaveBeenCalledTimes(2);
+      expect(searchVecSpy.mock.calls.map(call => call[3])).toEqual(["life", "main"]);
+      expect(results.map(result => result.file)).toEqual(["qmd://main/engram.md"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -3529,6 +3681,58 @@ describe("Embedding batching", () => {
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
       expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
     } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery searches each requested collection before candidate fusion", async () => {
+    const store = await createTestStore();
+    const model = "fake-embed-model";
+    const targetResult: SearchResult = {
+      filepath: "qmd://main/engram.md",
+      displayPath: "main/engram.md",
+      title: "Engram",
+      hash: "abcdef123456",
+      docid: "abcdef",
+      collectionName: "main",
+      modifiedAt: "",
+      bodyLength: 20,
+      body: "Engram memory system",
+      context: null,
+      score: 0.8,
+      source: "vec",
+      chunkPos: 0,
+    };
+    const searchVecSpy = vi.fn(async (
+      _query: string,
+      _model: string,
+      _limit?: number,
+      collection?: string,
+    ) => collection === "main" ? [targetResult] : []) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
+    } as any;
+    store.searchFTS = vi.fn(() => []) as any;
+    store.searchVec = searchVecSpy;
+    store.expandQuery = vi.fn(async () => []) as any;
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
+    try {
+      const results = await hybridQuery(store, "engram память workspace", {
+        collections: ["life", "main"],
+        limit: 1,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(searchVecSpy).toHaveBeenCalledTimes(2);
+      expect(searchVecSpy.mock.calls.map(call => call[3])).toEqual(["life", "main"]);
+      expect(results.map(result => result.file)).toEqual(["qmd://main/engram.md"]);
+    } finally {
+      setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
   });

@@ -3651,46 +3651,112 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
 
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
-    SELECT hash_seq, distance
-    FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  const totalVectorRows = (db.prepare(`SELECT COUNT(*) as count FROM vectors_vec`).get() as { count: number }).count;
+  if (totalVectorRows === 0) return [];
 
-  if (vecResults.length === 0) return [];
-
-  // Step 2: Get chunk info and document data
-  const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
-
-  // Build query for document lookup
-  const placeholders = hashSeqs.map(() => '?').join(',');
-  let docSql = `
-    SELECT
-      cv.hash || '_' || cv.seq as hash_seq,
-      cv.hash,
-      cv.pos,
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
-  `;
-  const params: string[] = [...hashSeqs];
-
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
-  }
-
-  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
+  // sqlite-vec cannot apply the collection filter inside the KNN query without
+  // a JOIN (which hangs; see PR #23). For scoped searches, progressively widen
+  // the global candidate window until the requested collection yields enough
+  // documents. sqlite-vec caps k at 4096, so an exact scoped fallback handles
+  // collections that are still absent or sparse after that global window.
+  const maxKnnLimit = Math.min(totalVectorRows, 4096);
+  let vectorLimit = Math.min(maxKnnLimit, Math.max(limit * 3, limit));
+  let vecResults: { hash_seq: string; distance: number }[] = [];
+  let docRows: {
     hash_seq: string; hash: string; pos: number; filepath: string;
     display_path: string; title: string; body: string;
-  }[]);
+  }[] = [];
+
+  const loadDocRows = (results: { hash_seq: string }[]) => {
+    if (results.length === 0) return [] as typeof docRows;
+    const hashSeqs = results.map(r => r.hash_seq);
+    const placeholders = hashSeqs.map(() => '?').join(',');
+    let docSql = `
+      SELECT
+        cv.hash || '_' || cv.seq as hash_seq,
+        cv.hash,
+        cv.pos,
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        content.doc as body
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash AND d.active = 1
+      JOIN content ON content.hash = d.hash
+      WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    `;
+    const params: string[] = [...hashSeqs];
+    if (collectionName) {
+      docSql += ` AND d.collection = ?`;
+      params.push(collectionName);
+    }
+    return withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as typeof docRows);
+  };
+
+  while (true) {
+    // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
+    vecResults = db.prepare(`
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = ?
+    `).all(new Float32Array(embedding), vectorLimit) as { hash_seq: string; distance: number }[];
+
+    if (vecResults.length === 0) return [];
+
+    // Step 2: Get chunk info and document data
+    docRows = loadDocRows(vecResults);
+
+    const uniqueFiles = new Set(docRows.map(row => row.filepath)).size;
+    if (!collectionName || uniqueFiles >= limit || vectorLimit >= maxKnnLimit) break;
+    vectorLimit = Math.min(maxKnnLimit, vectorLimit * 4);
+  }
+
+  // sqlite-vec cannot request k > 4096. If a scoped collection is still
+  // missing results after the maximum global window, score that collection's
+  // vectors exactly via point lookups. This path is intentionally a fallback:
+  // ordinary searches keep the fast KNN query, while sparse collections remain
+  // correct even in indexes with many unrelated vectors.
+  if (collectionName && new Set(docRows.map(row => row.filepath)).size < limit && totalVectorRows > maxKnnLimit) {
+    const scopedHashSeqs = withLazyContentVectorMigration(db, () => db.prepare(`
+      SELECT cv.hash || '_' || cv.seq as hash_seq
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash AND d.active = 1
+      WHERE d.collection = ?
+    `).all(collectionName) as { hash_seq: string }[]);
+    const getStoredVector = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`);
+    const queryVector = new Float32Array(embedding);
+    let queryNormSquared = 0;
+    for (const value of queryVector) queryNormSquared += value * value;
+    const queryNorm = Math.sqrt(queryNormSquared);
+
+    const exactResults: { hash_seq: string; distance: number }[] = [];
+    for (const { hash_seq } of scopedHashSeqs) {
+      const row = getStoredVector.get(hash_seq) as { embedding: Uint8Array } | undefined;
+      if (!row) continue;
+      const stored = row.embedding;
+      const vector = new Float32Array(stored.buffer, stored.byteOffset, Math.floor(stored.byteLength / 4));
+      if (vector.length !== queryVector.length) continue;
+      let dot = 0;
+      let vectorNormSquared = 0;
+      for (let i = 0; i < vector.length; i++) {
+        dot += queryVector[i]! * vector[i]!;
+        vectorNormSquared += vector[i]! * vector[i]!;
+      }
+      const denominator = queryNorm * Math.sqrt(vectorNormSquared);
+      exactResults.push({ hash_seq, distance: denominator > 0 ? 1 - (dot / denominator) : 1 });
+    }
+    exactResults.sort((a, b) => a.distance - b.distance);
+
+    let exactLimit = Math.min(exactResults.length, Math.max(limit * 3, limit));
+    while (exactLimit > 0) {
+      vecResults = exactResults.slice(0, exactLimit);
+      docRows = loadDocRows(vecResults);
+      if (new Set(docRows.map(row => row.filepath)).size >= limit || exactLimit >= exactResults.length) break;
+      exactLimit = Math.min(exactResults.length, exactLimit * 4);
+    }
+  }
+
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
 
   // Combine with distances and dedupe by filepath
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
@@ -4671,6 +4737,7 @@ export interface SearchHooks {
 
 export interface HybridQueryOptions {
   collection?: string;
+  collections?: string[];  // OR filter; searched before candidate truncation
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4736,7 +4803,11 @@ export async function hybridQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const collection = options?.collection;
+  const collections = Array.from(new Set([
+    ...(options?.collection ? [options.collection] : []),
+    ...(options?.collections ?? []),
+  ]));
+  const collectionList: (string | undefined)[] = collections.length > 0 ? collections : [undefined];
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -4754,7 +4825,35 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const searchFtsAcrossCollections = (text: string, searchLimit: number): SearchResult[] => {
+    const merged = new Map<string, SearchResult>();
+    for (const collection of collectionList) {
+      for (const result of store.searchFTS(text, searchLimit, collection)) {
+        const existing = merged.get(result.filepath);
+        if (!existing || result.score > existing.score) merged.set(result.filepath, result);
+      }
+    }
+    return Array.from(merged.values()).sort((a, b) => b.score - a.score).slice(0, searchLimit);
+  };
+
+  const searchVecAcrossCollections = async (
+    text: string,
+    model: string,
+    searchLimit: number,
+    embedding: number[],
+  ): Promise<SearchResult[]> => {
+    const merged = new Map<string, SearchResult>();
+    for (const collection of collectionList) {
+      const results = await store.searchVec(text, model, searchLimit, collection, undefined, embedding);
+      for (const result of results) {
+        const existing = merged.get(result.filepath);
+        if (!existing || result.score > existing.score) merged.set(result.filepath, result);
+      }
+    }
+    return Array.from(merged.values()).sort((a, b) => b.score - a.score).slice(0, searchLimit);
+  };
+
+  const initialFts = searchFtsAcrossCollections(query, 20);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -4791,7 +4890,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = searchFtsAcrossCollections(q.query, 20);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -4828,9 +4927,8 @@ export async function hybridQuery(
       const embedding = embeddings[i]?.embedding;
       if (!embedding) continue;
 
-      const vecResults = await store.searchVec(
-        vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding
+      const vecResults = await searchVecAcrossCollections(
+        vecQueries[i]!.text, embedModel, 20, embedding
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -5013,6 +5111,7 @@ export async function hybridQuery(
 
 export interface VectorSearchOptions {
   collection?: string;
+  collections?: string[];  // OR filter; searched before result truncation
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5045,7 +5144,11 @@ export async function vectorSearchQuery(
 ): Promise<VectorSearchResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
-  const collection = options?.collection;
+  const collections = Array.from(new Set([
+    ...(options?.collection ? [options.collection] : []),
+    ...(options?.collections ?? []),
+  ]));
+  const collectionList: (string | undefined)[] = collections.length > 0 ? collections : [undefined];
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -5064,19 +5167,21 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
-    for (const r of vecResults) {
-      const existing = allResults.get(r.filepath);
-      if (!existing || r.score > existing.score) {
-        allResults.set(r.filepath, {
-          file: r.filepath,
-          displayPath: r.displayPath,
-          title: r.title,
-          body: r.body || "",
-          score: r.score,
-          context: store.getContextForFile(r.filepath),
-          docid: r.docid,
-        });
+    for (const collection of collectionList) {
+      const vecResults = await store.searchVec(q, embedModel, limit, collection);
+      for (const r of vecResults) {
+        const existing = allResults.get(r.filepath);
+        if (!existing || r.score > existing.score) {
+          allResults.set(r.filepath, {
+            file: r.filepath,
+            displayPath: r.displayPath,
+            title: r.title,
+            body: r.body || "",
+            score: r.score,
+            context: store.getContextForFile(r.filepath),
+            docid: r.docid,
+          });
+        }
       }
     }
   }
