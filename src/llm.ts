@@ -110,6 +110,15 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * Detect BERTA (sentence-similarity) model URIs. These need FRIDA-style
+ * "search_query:" / "search_document:" prefixes to reach advertised quality
+ * on ruMTEB (see sergeyzh/BERTA-uncased README).
+ */
+export function isBertaModel(modelUri: string): boolean {
+  return /berta/i.test(modelUri);
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
@@ -123,6 +132,10 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
+  }
+  if (isBertaModel(uri)) {
+    // FRIDA/BERTA prefix inherited from teacher (ruMTEB config).
+    return `search_query: ${query}`;
   }
   return `task: search result | query: ${query}`;
 }
@@ -142,6 +155,11 @@ export function formatDocForEmbedding(text: string, title?: string, modelUri?: s
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
+  }
+  if (isBertaModel(uri)) {
+    // FRIDA/BERTA document prefix. Title goes after the prefix (FRIDA convention).
+    const body = title ? `${title}\n${text}` : text;
+    return `search_document: ${body}`;
   }
   return `title: ${title || "none"} | text: ${text}`;
 }
@@ -2108,6 +2126,13 @@ export function getDefaultLlamaCpp(): LlamaCpp {
     }
     return defaultLlamaCpp;
   }
+  if (process.env.QMD_LLM_PROVIDER === 'hybrid') {
+    if (!defaultLlamaCpp) {
+      const { HybridLLM } = loadHybridLLM();
+      defaultLlamaCpp = new HybridLLM() as unknown as LlamaCpp;
+    }
+    return defaultLlamaCpp;
+  }
   if (!defaultLlamaCpp) {
     // node-llama-cpp is an optional dependency in this fork (it brings in a
     // ~hundreds-of-MB native build). If the user did not opt into a cloud
@@ -2149,6 +2174,9 @@ function loadOpenAILLM(): { OpenAILLM: _Ctor } {
 }
 function loadOllamaLLM(): { OllamaLLM: _Ctor } {
   return _require("./ollama-llm.js") as { OllamaLLM: _Ctor };
+}
+function loadHybridLLM(): { HybridLLM: _Ctor } {
+  return _require("./hybrid-llm.js") as { HybridLLM: _Ctor };
 }
 
 /**

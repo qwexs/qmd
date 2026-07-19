@@ -139,7 +139,8 @@ function getStore(): ReturnType<typeof createStore> {
       if (
         process.env.QMD_LLM_PROVIDER !== 'jina' &&
         process.env.QMD_LLM_PROVIDER !== 'openai' &&
-        process.env.QMD_LLM_PROVIDER !== 'ollama'
+        process.env.QMD_LLM_PROVIDER !== 'ollama' &&
+        process.env.QMD_LLM_PROVIDER !== 'hybrid'
       ) {
         try {
           setDefaultLlamaCpp(new LlamaCpp({
@@ -2557,7 +2558,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     let results = await vectorSearchQuery(store, query, {
       collections: collectionNames.length > 0 ? collectionNames : undefined,
       limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
+      minScore: opts.minScore ?? 0.3,
       intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
@@ -2622,7 +2623,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       results = await structuredSearch(store, structuredQueries, {
         collections: collectionNames.length > 0 ? collectionNames : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
+        minScore: opts.minScore ?? 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
@@ -2650,7 +2651,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       results = await hybridQuery(store, query, {
         collections: collectionNames.length > 0 ? collectionNames : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
+        minScore: opts.minScore ?? 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
