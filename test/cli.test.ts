@@ -314,6 +314,39 @@ describe("CLI Skills", () => {
 });
 
 describe("CLI Embed", () => {
+  test("reports embed orchestration capabilities", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["capabilities", "--format", "json"]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    const result = JSON.parse(stdout);
+    expect(result.schema).toBe("qmd.capabilities.v1");
+    expect(result.embed).toEqual({
+      multipleCollections: true,
+      indexScopedLock: true,
+      structuredOutput: true,
+    });
+  });
+
+  test("emits a structured result when no documents are pending", async () => {
+    const isolated = await createIsolatedTestEnv("embed-json");
+    const { stdout, stderr, exitCode } = await runQmd(["embed", "--format", "json"], isolated);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    const result = JSON.parse(stdout);
+    expect(result).toMatchObject({
+      schema: "qmd.embed.v1",
+      status: "ok",
+      pendingBefore: 0,
+      pendingAfter: 0,
+      documentsEmbedded: 0,
+      chunksEmbedded: 0,
+      skippedReason: "no-pending-documents",
+    });
+    const db = openDatabase(isolated.dbPath);
+    expect(db.prepare(`SELECT COUNT(*) AS count FROM runtime_locks`).get()).toEqual({ count: 0 });
+    db.close();
+  });
+
   test("prefers QMD_EMBED_MODEL for qmd embed when the index has no model pin", () => {
     const prev = process.env.QMD_EMBED_MODEL;
     process.env.QMD_EMBED_MODEL = "hf:env/embed-model.gguf";

@@ -659,6 +659,12 @@ qmd embed
 # Force re-embed everything
 qmd embed -f
 
+# Embed an explicit allowlist in one model session
+qmd embed -c project-memory -c project-domains -c life
+
+# Machine-readable result for schedulers and health checks
+qmd embed -c project-memory -c life --format json
+
 # Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
 qmd embed --chunk-strategy auto
 
@@ -669,6 +675,17 @@ qmd query "auth flow" --chunk-strategy auto
 qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
 ```
+
+Multiple `-c` flags are applied as one collection allowlist. QMD loads the
+embedding model once and processes pending content from every selected
+collection. Embedding is protected by an atomic lock scoped to the physical
+index, so overlapping manual or scheduled runs safely return
+`skippedReason: "lock-held"` instead of doing duplicate work. Abandoned lock
+files are recovered after their owner is no longer alive (or the stale
+timeout expires for a remote owner).
+
+Use `qmd capabilities --format json` to detect support for multi-collection
+embedding, index-scoped locking, and structured output.
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text

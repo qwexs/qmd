@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [2.6.3-fork.2] - 2026-07-20
+
+### Added
+
+- `qmd embed` now treats repeated `-c` flags as one collection allowlist,
+  processing all selected collections in a single model session.
+- Embed runs use an atomic compare-and-swap lock inside the physical SQLite
+  index. Concurrent callers exit successfully with `skippedReason:
+  "lock-held"`; stale owners are recovered without allowing a caller to delete
+  another process's lock.
+- `qmd embed --format json` emits the stable `qmd.embed.v1` result, and
+  `qmd capabilities --format json` advertises the orchestration contract for
+  schedulers and health checks.
+- `node-llama-cpp` is packaged as an optional runtime dependency, so packaged
+  installs can use local and hybrid embedding providers without a separate
+  global install.
+
 ## [2.6.3-fork.1] - 2026-07-16
 
 Fork sync with upstream tobi/qmd v2.6.3 (HEAD 62b3a67..upstream/main, 15 non-merge

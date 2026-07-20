@@ -53,6 +53,7 @@ import {
   insertContent,
   insertDocument,
   generateEmbeddings,
+  getHashesNeedingEmbedding,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -2491,6 +2492,18 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("getHashesNeedingEmbedding accepts a collection allowlist", async () => {
+    const store = await createTestStore();
+    await insertTestDocument(store.db, "alpha", { name: "a", hash: "hash-a" });
+    await insertTestDocument(store.db, "beta", { name: "b", hash: "hash-b" });
+    await insertTestDocument(store.db, "gamma", { name: "c", hash: "hash-c" });
+
+    expect(getHashesNeedingEmbedding(store.db, ["alpha", "beta"])).toBe(2);
+    expect(getHashesNeedingEmbedding(store.db, ["gamma"])).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
   test("embedding health is scoped to the active embed model", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -3357,6 +3370,31 @@ describe("Embedding batching", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings processes all and only allowlisted collections", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "alpha", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "beta", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "gamma", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, { collections: ["alpha", "beta"] });
+
+      expect(result.docsProcessed).toBe(2);
+      expect(fakeLlm.embedBatchCalls.flat()).toHaveLength(2);
+      expect(getHashesNeedingEmbedding(db, ["alpha", "beta"])).toBe(0);
+      expect(getHashesNeedingEmbedding(db, ["gamma"])).toBe(1);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
