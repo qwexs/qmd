@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- Clarified that embed locks are scoped to one physical SQLite index, while
+  CLI processes targeting different indexes can load models concurrently and
+  must be resource-limited by the scheduler when necessary.
+
 ## [2.6.3-fork.2] - 2026-07-20
 
 ### Added

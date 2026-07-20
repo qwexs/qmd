@@ -681,8 +681,15 @@ embedding model once and processes pending content from every selected
 collection. Embedding is protected by an atomic lock scoped to the physical
 index, so overlapping manual or scheduled runs safely return
 `skippedReason: "lock-held"` instead of doing duplicate work. Abandoned lock
-files are recovered after their owner is no longer alive (or the stale
-timeout expires for a remote owner).
+rows are recovered after their owner is no longer alive (or the stale timeout
+expires for a remote owner).
+
+For ordinary CLI use, every `qmd embed` invocation is a separate process: the
+model is loaded for that command and released when the process exits. The lock
+does not serialize different physical indexes. Embeds against separate index
+files can therefore run concurrently and their RAM/VRAM usage can add up. If
+that is undesirable, limit scheduler-level embed concurrency; do not merge
+otherwise isolated indexes merely to share this lock.
 
 Use `qmd capabilities --format json` to detect support for multi-collection
 embedding, index-scoped locking, and structured output.
