@@ -20,11 +20,11 @@
       },
       "devDependencies": {
         "@types/better-sqlite3": "7.6.13",
-        "node-llama-cpp": "3.18.1",
         "tsx": "4.21.0",
         "vitest": "3.2.4",
       },
       "optionalDependencies": {
+        "node-llama-cpp": "3.18.1",
         "sqlite-vec-darwin-arm64": "0.1.9",
         "sqlite-vec-darwin-x64": "0.1.9",
         "sqlite-vec-linux-arm64": "0.1.9",

@@ -1503,6 +1503,11 @@ export type EmbedOptions = {
    * When omitted, all pending documents across every collection are embedded.
    */
   collection?: string;
+  /**
+   * Restrict embedding to documents in any of these collections. Duplicate
+   * names are ignored. Takes precedence over the legacy `collection` field.
+   */
+  collections?: readonly string[];
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
@@ -1601,8 +1606,17 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+function normalizeCollectionFilter(collections?: string | readonly string[]): string[] {
+  if (collections == null) return [];
+  const values = Array.isArray(collections) ? collections : [collections];
+  return [...new Set(values.map((value) => String(value)).filter(Boolean))];
+}
+
+function getPendingEmbeddingDocs(db: Database, collectionsInput?: string | readonly string[], model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+  const collections = normalizeCollectionFilter(collectionsInput);
+  const collectionFilter = collections.length > 0
+    ? `AND d.collection IN (${collections.map(() => "?").join(",")})`
+    : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -1621,7 +1635,7 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    return stmt.all(model, fingerprint, ...collections) as PendingEmbeddingDoc[];
   });
 }
 
@@ -1690,11 +1704,13 @@ export async function generateEmbeddings(
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
 
+  const collections = normalizeCollectionFilter(options?.collections ?? options?.collection);
+
   if (options?.force) {
-    clearAllEmbeddings(db, options?.collection);
+    clearAllEmbeddings(db, collections.length > 0 ? collections : undefined);
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  const docsToEmbed = getPendingEmbeddingDocs(db, collections, model);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -2229,8 +2245,11 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+export function getHashesNeedingEmbedding(db: Database, collectionsInput?: string | readonly string[], model: string = DEFAULT_EMBED_MODEL): number {
+  const collections = normalizeCollectionFilter(collectionsInput);
+  const collectionFilter = collections.length > 0
+    ? `AND d.collection IN (${collections.map(() => "?").join(",")})`
+    : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -2246,7 +2265,7 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
         ${collectionFilter}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = stmt.get(model, fingerprint, ...collections) as { count: number };
     return result.count;
   });
 }
@@ -3842,24 +3861,27 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  * clear empties content_vectors entirely, in which case it is dropped so the
  * next embed can recreate the table with the current dimensions.
  */
-export function clearAllEmbeddings(db: Database, collection?: string): void {
-  if (!collection) {
+export function clearAllEmbeddings(db: Database, collectionsInput?: string | readonly string[]): void {
+  const collections = normalizeCollectionFilter(collectionsInput);
+  if (collections.length === 0) {
     db.exec(`DELETE FROM content_vectors`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
     return;
   }
 
+  const placeholders = collections.map(() => "?").join(",");
   const exclusiveHashesQuery = `
     SELECT DISTINCT d.hash
     FROM documents d
-    WHERE d.collection = ? AND d.active = 1
+    WHERE d.collection IN (${placeholders}) AND d.active = 1
       AND NOT EXISTS (
         SELECT 1 FROM documents d2
         WHERE d2.hash = d.hash
           AND d2.active = 1
-          AND d2.collection != d.collection
+          AND d2.collection NOT IN (${placeholders})
       )
   `;
+  const collectionParams = [...collections, ...collections];
 
   const vecTableExists = db
     .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
@@ -3871,7 +3893,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
         SELECT cv.hash, cv.seq
         FROM content_vectors cv
         WHERE cv.hash IN (${exclusiveHashesQuery})
-      `).all(collection) as { hash: string; seq: number }[];
+      `).all(...collectionParams) as { hash: string; seq: number }[];
 
       const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
       for (const row of hashSeqRows) {
@@ -3882,7 +3904,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     db.prepare(`
       DELETE FROM content_vectors
       WHERE hash IN (${exclusiveHashesQuery})
-    `).run(collection);
+    `).run(...collectionParams);
 
     const remaining = db
       .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)

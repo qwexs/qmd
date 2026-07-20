@@ -65,6 +65,7 @@ import {
   type ExpandedQuery,
   type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
+  DEFAULT_EMBED_MAX_DURATION_MS,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
@@ -80,6 +81,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
+import { acquireEmbedLock } from "../embed-lock.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -1895,43 +1897,100 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
-): Promise<void> {
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collections?: string[]; maxDurationMs?: number; format?: OutputFormat },
+): Promise<EmbedCommandResult> {
+  const collections = [...new Set((batchOptions?.collections ?? []).filter(Boolean))];
+  const collectionFilter = collections.length > 0 ? collections : undefined;
+  const format = batchOptions?.format ?? "cli";
+  const indexPath = getDbPath();
+  const lockStaleMs = resolveEmbedLockStaleMs(batchOptions?.maxDurationMs);
   const storeInstance = getStore();
-  const db = storeInstance.db;
-
-  if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-  }
-
-  // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-  if (hashesToEmbed === 0 && !force) {
-    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+  let lock;
+  try {
+    lock = acquireEmbedLock(storeInstance.db, indexPath, { staleMs: lockStaleMs });
+  } catch (error) {
     closeDb();
-    return;
+    throw error;
   }
 
-  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
-  if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
-    const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
-    const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
-    console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+  if (!lock.acquired) {
+    const result: EmbedCommandResult = {
+      schema: "qmd.embed.v1",
+      status: "skipped",
+      index: indexPath,
+      collections,
+      pendingBefore: null,
+      pendingAfter: null,
+      documentsEmbedded: 0,
+      chunksEmbedded: 0,
+      errors: 0,
+      elapsedMs: 0,
+      skippedReason: "lock-held",
+      lock: {
+        recoveredStale: lock.recoveredStale,
+        ownerPid: lock.owner?.pid ?? null,
+        ownerStartedAt: lock.owner?.startedAt ?? null,
+      },
+    };
+    closeDb();
+    printEmbedResult(result, format);
+    return result;
   }
-  cursor.hide();
-  progress.indeterminate();
 
-  const startTime = Date.now();
+  const startedAt = Date.now();
+  let cursorHidden = false;
+  try {
+    const db = storeInstance.db;
 
-  const result = await generateEmbeddings(storeInstance, {
-    force,
-    model,
-    collection: batchOptions?.collection,
-    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
-    maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
-    maxDurationMs: batchOptions?.maxDurationMs,
-    onProgress: (info) => {
+    if (force && format !== "json") {
+      console.log(`${c.yellow}Force re-indexing: clearing selected vectors...${c.reset}`);
+    }
+
+    // Check while holding the index-scoped lock so two callers cannot both
+    // observe the same pending work and load the model concurrently.
+    const hashesToEmbed = getHashesNeedingEmbedding(db, collectionFilter, model);
+    if (hashesToEmbed === 0 && !force) {
+      const result: EmbedCommandResult = {
+        schema: "qmd.embed.v1",
+        status: "ok",
+        index: indexPath,
+        collections,
+        pendingBefore: 0,
+        pendingAfter: 0,
+        documentsEmbedded: 0,
+        chunksEmbedded: 0,
+        errors: 0,
+        elapsedMs: Date.now() - startedAt,
+        skippedReason: "no-pending-documents",
+        lock: { recoveredStale: lock.recoveredStale, ownerPid: process.pid, ownerStartedAt: lock.owner?.startedAt ?? null },
+      };
+      printEmbedResult(result, format);
+      return result;
+    }
+
+    if (format !== "json") {
+      console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+      if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
+        const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
+        const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
+        console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+      }
+      cursor.hide();
+      cursorHidden = true;
+      progress.indeterminate();
+    }
+
+    const startTime = Date.now();
+
+    const embedResult = await generateEmbeddings(storeInstance, {
+      force,
+      model,
+      collections: collectionFilter,
+      maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+      maxBatchBytes: batchOptions?.maxBatchBytes,
+      chunkStrategy: batchOptions?.chunkStrategy,
+      maxDurationMs: batchOptions?.maxDurationMs,
+      onProgress: format === "json" ? undefined : (info) => {
       if (info.totalBytes === 0) return;
       // Progress is measured by input bytes, not by chunks. The final chunk
       // count is discovered lazily batch-by-batch, so displaying
@@ -1955,31 +2014,94 @@ async function vectorIndex(
       const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
       if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
-    },
-  });
+      },
+    });
 
-  progress.clear();
-  cursor.show();
+    if (cursorHidden) {
+      progress.clear();
+      cursor.show();
+      cursorHidden = false;
+    }
 
-  const totalTimeSec = result.durationMs / 1000;
+    const pendingAfter = getHashesNeedingEmbedding(db, collectionFilter, model);
+    const result: EmbedCommandResult = {
+      schema: "qmd.embed.v1",
+      status: embedResult.errors > 0 ? "partial" : "ok",
+      index: indexPath,
+      collections,
+      pendingBefore: hashesToEmbed,
+      pendingAfter,
+      documentsEmbedded: embedResult.docsProcessed,
+      chunksEmbedded: embedResult.chunksEmbedded,
+      errors: embedResult.errors,
+      elapsedMs: Date.now() - startedAt,
+      skippedReason: null,
+      lock: { recoveredStale: lock.recoveredStale, ownerPid: process.pid, ownerStartedAt: lock.owner?.startedAt ?? null },
+      ...(embedResult.failures?.length ? { failures: embedResult.failures } : {}),
+    };
 
-  if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
-    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-  } else {
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
-    if (result.errors > 0) {
-      console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
-      for (const failure of (result.failures ?? []).slice(0, 8)) {
+    if (format === "json") {
+      printEmbedResult(result, format);
+    } else if (embedResult.chunksEmbedded === 0 && embedResult.docsProcessed === 0) {
+      console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+    } else {
+      const totalTimeSec = embedResult.durationMs / 1000;
+      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${embedResult.chunksEmbedded}${c.reset} chunks from ${c.bold}${embedResult.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      if (embedResult.errors > 0) {
+        console.log(`${c.yellow}⚠ ${formatCount(embedResult.errors)} chunks still failed after retries${c.reset}`);
+        for (const failure of (embedResult.failures ?? []).slice(0, 8)) {
         console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
-      }
-      if ((result.failures?.length ?? 0) > 8) {
-        console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+        }
+        if ((embedResult.failures?.length ?? 0) > 8) {
+          console.log(`  ${c.dim}...and ${formatCount((embedResult.failures?.length ?? 0) - 8)} more${c.reset}`);
+        }
       }
     }
+    return result;
+  } finally {
+    if (cursorHidden) {
+      progress.clear();
+      cursor.show();
+    }
+    lock.release();
+    closeDb();
   }
+}
 
-  closeDb();
+type EmbedCommandResult = {
+  schema: "qmd.embed.v1";
+  status: "ok" | "partial" | "skipped";
+  index: string;
+  collections: string[];
+  pendingBefore: number | null;
+  pendingAfter: number | null;
+  documentsEmbedded: number;
+  chunksEmbedded: number;
+  errors: number;
+  elapsedMs: number;
+  skippedReason: "no-pending-documents" | "lock-held" | null;
+  lock: { recoveredStale: boolean; ownerPid: number | null; ownerStartedAt: string | null };
+  failures?: unknown[];
+};
+
+function resolveEmbedLockStaleMs(maxDurationMs?: number): number {
+  const configured = Number(process.env.QMD_EMBED_LOCK_STALE_MS);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  const sessionCap = maxDurationMs == null ? DEFAULT_EMBED_MAX_DURATION_MS : maxDurationMs;
+  return sessionCap > 0 ? sessionCap + 5 * 60 * 1000 : 2 * 60 * 60 * 1000;
+}
+
+function printEmbedResult(result: EmbedCommandResult, format: OutputFormat): void {
+  if (format === "json") {
+    console.log(JSON.stringify(result));
+    return;
+  }
+  if (result.skippedReason === "lock-held") {
+    console.log(`${c.yellow}↷ Embed already running for this index; skipped.${c.reset}`);
+  } else if (result.skippedReason === "no-pending-documents") {
+    console.log(`${c.green}✓ All selected content hashes already have embeddings.${c.reset}`);
+  }
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -3290,11 +3412,13 @@ function showHelp(): void {
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
+  console.log("  qmd embed [-f] [-c <name>...] - Generate/refresh vector embeddings");
+  console.log("    --format json               - Emit the qmd.embed.v1 machine-readable result");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("  qmd capabilities [--format json] - Report machine-readable runtime capabilities");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -3984,6 +4108,27 @@ async function showVersion(): Promise<void> {
   console.log(`qmd ${versionStr}`);
 }
 
+function showCapabilities(format: OutputFormat): void {
+  const payload = {
+    schema: "qmd.capabilities.v1",
+    version: readPackageJson().version,
+    embed: {
+      multipleCollections: true,
+      indexScopedLock: true,
+      structuredOutput: true,
+    },
+  };
+  if (format === "json") {
+    console.log(JSON.stringify(payload));
+    return;
+  }
+  console.log("QMD capabilities");
+  console.log(`  Version: ${payload.version}`);
+  console.log("  Embed multiple collections: yes");
+  console.log("  Embed index-scoped lock: yes");
+  console.log("  Embed structured output: yes");
+}
+
 // Main CLI - only run if this is the main module
 const __filename = fileURLToPath(import.meta.url);
 const argv1 = process.argv[1];
@@ -4292,6 +4437,10 @@ if (isMain) {
       await showStatus();
       break;
 
+    case "capabilities":
+      showCapabilities(cli.opts.format);
+      break;
+
     case "doctor":
       await showDoctor();
       break;
@@ -4309,15 +4458,14 @@ if (isMain) {
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
-        // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
-        const embedCollection = embedValidatedCollections[0];
         await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
-          collection: embedCollection,
+          collections: embedValidatedCollections,
           maxDurationMs: embedMaxDurationMs,
+          format: cli.opts.format,
         });
       } catch (error) {
         exitWithError(error);
