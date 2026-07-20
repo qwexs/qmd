@@ -10,7 +10,10 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
-    shell: process.platform === "win32",
+    // Passing an absolute executable path through cmd.exe breaks when Node is
+    // installed under "C:\\Program Files". spawnSync handles it directly on
+    // every supported platform.
+    shell: false,
     ...options,
   });
   if (result.status !== 0) {
