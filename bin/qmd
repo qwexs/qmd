@@ -161,11 +161,9 @@ if (existsSync(resolve(pkgDir, "package-lock.json"))) {
 
 const runner = useSourceMode ? sourceRunner : (runnerName === "node" ? "node" : "bun");
 const args = useSourceMode ? sourceArgs : [jsEntry, ...process.argv.slice(2)];
-const needsShell = (runner === "bun") && process.platform === "win32";
-
 const child = spawn(runner, args, {
   stdio: "inherit",
-  shell: needsShell,
+  shell: false,
 });
 
 child.on("exit", (code, signal) => {
