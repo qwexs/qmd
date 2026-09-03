@@ -49,6 +49,8 @@ export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   editor_uri?: string;                        // Editor URI template for terminal hyperlinks
   editor_uri_template?: string;               // Alias for editor_uri
+  editorUri?: string;                         // camelCase alias for editor_uri
+  "editor-uri"?: string;                      // kebab-case alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
 }
@@ -109,7 +111,7 @@ export function setConfigIndexName(name: string): void {
   }
 }
 
-function getConfigDir(): string {
+export function getConfigDir(): string {
   // Allow override via QMD_CONFIG_DIR for testing
   if (process.env.QMD_CONFIG_DIR) {
     return process.env.QMD_CONFIG_DIR;

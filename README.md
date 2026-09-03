@@ -4,7 +4,24 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
-![QMD Architecture](assets/qmd-architecture.png)
+```mermaid
+flowchart LR
+  Q[User Query] --> X[Query Expansion]
+  Q --> FTS[BM25 Search]
+  Q --> VS[Vector Search]
+  X --> HYDE[HyDE]
+  X --> VEC[Vec dense sentences]
+  X --> LEX[Lex BM25 keywords]
+  HYDE --> VS
+  VEC --> VS
+  LEX --> FTS
+  VS --> RRF[Reciprocal Rank Fusion]
+  FTS --> RRF
+  RRF --> RR[LLM Reranker]
+  RR --> OUT[Final ranked results]
+```
+
+Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. The original query is sent to both backends, then fused with RRF and reranked.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
@@ -53,59 +70,6 @@ qmd search "API" -c notes
 # Export all matches for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
-
-### Cloud Providers (no local GPU required)
-
-By default, QMD runs all models locally via node-llama-cpp (requires GPU or fast CPU). You can switch to cloud APIs instead:
-
-**OpenAI:**
-
-```sh
-export QMD_LLM_PROVIDER=openai
-export OPENAI_API_KEY=sk-proj-xxx
-
-# Optional: customize models
-export OPENAI_EMBED_MODEL=text-embedding-3-small    # default
-export OPENAI_GENERATE_MODEL=gpt-4o-mini            # default (query expansion)
-
-# Optional: use OpenAI-compatible providers (Azure, vLLM, LiteLLM, etc.)
-export OPENAI_BASE_URL=https://your-provider.com/v1
-```
-
-**Jina AI:**
-
-```sh
-export QMD_LLM_PROVIDER=jina
-export JINA_API_KEY=jina_xxxxxxxxxxxx
-
-# Optional: customize models
-export JINA_EMBED_MODEL=jina-embeddings-v3                      # default
-export JINA_RERANK_MODEL=jina-reranker-v2-base-multilingual     # default
-export JINA_EMBED_DIMENSIONS=1024                               # default
-```
-
-**Ollama Cloud:**
-
-```sh
-export QMD_LLM_PROVIDER=ollama
-export OLLAMA_API_KEY=ollama_xxxxxxxxxxxx       # from https://ollama.com/settings/keys
-
-# Optional: customize embed model
-export OLLAMA_EMBED_MODEL=nomic-embed-text      # default
-export OLLAMA_EMBED_DIMENSIONS=                # default — model decides (nomic = 768)
-
-# Self-hosted Ollama: same provider, point at your local instance
-# export OLLAMA_BASE_URL=http://localhost:11434
-# (then `ollama pull nomic-embed-text` or any other embed model)
-```
-
-Ollama is search-only: embeddings via `/api/embed`, reranking via cosine
-similarity over those embeddings (no native `/api/rerank` in the Ollama API).
-Query expansion is skipped (no `generate` model), matching Jina's surface.
-
-> Without `QMD_LLM_PROVIDER`, QMD downloads ~2GB of GGUF models on first run and uses them locally. Set the variable to skip local models entirely.
->
-> See [Environment Variables](#environment-variables) for the full reference.
 
 ### Using with AI Agents
 
@@ -187,7 +151,31 @@ runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `POST /query` (alias `/search`) — structured search without the MCP protocol
 - `GET /health` — liveness check with uptime
+
+
+##### Origin and Host validation
+
+Every request is screened before routing: a request carrying an `Origin` header
+that does not name a loopback address is rejected with `403`, as is a `Host`
+header naming something other than the address the server is bound to. This is
+what stops a web page you visit from reading your index through DNS rebinding —
+loopback binding alone does not, since the browser makes the request from your
+own machine.
+
+Requests without an `Origin` header — curl, MCP clients, editors — are
+unaffected, which covers every normal local client.
+
+| Variable | Effect |
+|----------|--------|
+| `QMD_ALLOWED_ORIGINS` | Comma-separated origins to accept in addition to loopback, e.g. `https://notes.internal`. Set to `*` to disable the check entirely. |
+| `QMD_ALLOWED_HOSTS` | Comma-separated `Host` values to accept in addition to loopback and the bind address. |
+
+`--host 0.0.0.0` cannot know which `Host` values are legitimate, so it skips the
+host check and warns at startup. Set `QMD_ALLOWED_HOSTS` to re-enable it, and
+remember the endpoints are unauthenticated — put your own auth in front of a
+server that is reachable off-host.
 
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
@@ -608,7 +596,7 @@ bun install -g @tobilu/qmd
 ### Development
 
 ```sh
-git clone https://github.com/qwexs/qmd
+git clone https://github.com/tobi/qmd
 cd qmd
 npm install
 npm link
@@ -624,6 +612,9 @@ qmd collection add . --name myproject
 
 # Create a collection with explicit path and custom glob mask
 qmd collection add ~/Documents/notes --name notes --mask "**/*.md"
+
+# Comma-separated masks are a union (brace form `{a,b}` also works)
+qmd collection add ~/notes --name notes --mask "sources/**/*.md,CO - *.md"
 
 # List all collections
 qmd collection list
@@ -659,12 +650,6 @@ qmd embed
 # Force re-embed everything
 qmd embed -f
 
-# Embed an explicit allowlist in one model session
-qmd embed -c project-memory -c project-domains -c life
-
-# Machine-readable result for schedulers and health checks
-qmd embed -c project-memory -c life --format json
-
 # Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
 qmd embed --chunk-strategy auto
 
@@ -675,17 +660,6 @@ qmd query "auth flow" --chunk-strategy auto
 qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
 ```
-
-Multiple `-c` flags are applied as one collection allowlist. QMD loads the
-embedding model once and processes pending content from every selected
-collection. Embedding is protected by an atomic lock scoped to the physical
-index, so overlapping manual or scheduled runs safely return
-`skippedReason: "lock-held"` instead of doing duplicate work. Abandoned lock
-files are recovered after their owner is no longer alive (or the stale
-timeout expires for a remote owner).
-
-Use `qmd capabilities --format json` to detect support for multi-collection
-embedding, index-scoped locking, and structured output.
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
@@ -777,7 +751,7 @@ collections:
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
 | `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
-| `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. |
+| `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
@@ -817,6 +791,37 @@ re-indexed. Set or clear it from the CLI instead of editing YAML by hand:
 qmd collection update-cmd wiki 'git pull --ff-only'   # set
 qmd collection update-cmd wiki                         # clear
 ```
+
+##### Checked-in `.qmd` config is not trusted by default
+
+A project-local `.qmd/index.yml` travels with a `git clone`, and QMD adopts it
+automatically for any command run inside the tree. Three fields in that file can
+reach outside the project, and QMD will not use them unattended:
+
+- `update` commands — somebody else's shell script, run by `qmd update`
+- `collections.*.path` pointing **outside** the project directory
+- `models.embed` / `models.rerank` / `models.generate` other than the built-in
+  defaults (any `hf:` repo or local GGUF path)
+
+In-project collection paths (for example `./docs`) still index. On a terminal
+`qmd update` (and `qmd embed` / `qmd pull` / `qmd query`) lists the gated
+fields and asks. Approving records the approval in `~/.config/qmd/trusted.json`.
+With no terminal to ask — agents, CI, MCP — those fields are **skipped** and
+in-project indexing continues.
+
+Approvals cover the exact gated set you saw. Editing a command, pointing a
+collection outside the project, or changing a custom model URI asks again.
+
+```sh
+qmd trust           # review and approve this project's gated fields
+qmd trust list      # show every approved project config
+qmd trust revoke    # drop the approval for this project
+```
+
+Set `QMD_TRUST_LOCAL_CONFIG=1` (or `QMD_TRUST_UPDATE_HOOKS=1`) for CI that
+should allow them unattended. Your own `~/.config/qmd/*.yml` — including
+anything `qmd collection update-cmd` or `qmd collection add` writes — is
+never gated.
 
 ### Search Commands
 
@@ -860,6 +865,9 @@ and `deep-search` (→ `query`).
 --no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
 -C, --candidate-limit <n>  # Max candidates to rerank (default: 40)
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
+                   # (a result whose file has moved or been deleted since
+                   #  indexing keeps its qmd:// URI + docid, and a notice is
+                   #  printed to stderr — run `qmd update` to refresh)
 
 # Output formats (for search and multi-get)
 --format <kind>    # cli (default) | json | csv | md | xml | files
@@ -1134,8 +1142,6 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ## Environment Variables
 
-### General
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
@@ -1144,113 +1150,6 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
-| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina`, `openai`, or `ollama`. When unset, QMD uses local GGUF models via node-llama-cpp |
-
-### Cloud Providers (fork feature — no local GPU required)
-
-This fork adds three cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
-
-#### Install without native build (Ubuntu / Windows, cloud-only)
-
-`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`, or `=ollama`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
-
-```sh
-bun add node-llama-cpp   # or: npm install node-llama-cpp
-# (requires a working C++ toolchain on your platform)
-```
-
-#### Jina AI (`QMD_LLM_PROVIDER=jina`)
-
-Use [Jina AI](https://jina.ai/) cloud APIs for embeddings and reranking. Query expansion is skipped (not supported by Jina).
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JINA_API_KEY` | — | **Required.** Jina AI API key |
-| `JINA_EMBED_MODEL` | `jina-embeddings-v3` | Embedding model |
-| `JINA_RERANK_MODEL` | `jina-reranker-v2-base-multilingual` | Rerank model |
-| `JINA_EMBED_DIMENSIONS` | `1024` | Embedding vector dimensions |
-| `JINA_PROXY_URL` | — | HTTP proxy URL |
-
-```sh
-export QMD_LLM_PROVIDER=jina
-export JINA_API_KEY=jina_xxxxxxxxxxxx
-```
-
-#### OpenAI (`QMD_LLM_PROVIDER=openai`)
-
-Use OpenAI-compatible APIs for embeddings and generation (query expansion). Reranking uses cosine similarity instead of a cross-encoder. Query expansion uses `OPENAI_GENERATE_MODEL`.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` | — | **Required.** OpenAI API key |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL (change for OpenAI-compatible providers) |
-| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
-| `OPENAI_GENERATE_MODEL` | `gpt-4o-mini` | Generation model (for query expansion) |
-| `OPENAI_PROXY_URL` | — | HTTP proxy URL |
-
-```sh
-export QMD_LLM_PROVIDER=openai
-export OPENAI_API_KEY=sk-proj-xxxxxxxxxxxx
-```
-
-> **Tip:** Set `OPENAI_BASE_URL` to use any OpenAI-compatible API (e.g., Azure OpenAI, local vLLM, LiteLLM).
-
-#### Ollama Cloud (`QMD_LLM_PROVIDER=ollama`)
-
-Use the [Ollama Cloud](https://ollama.com/cloud) REST API for embeddings.
-Reranking uses cosine similarity over those embeddings (Ollama does not
-expose a native rerank endpoint). Query expansion is skipped (no `generate`
-model), matching Jina's surface.
-
-The same provider also works against a self-hosted Ollama instance — set
-`OLLAMA_BASE_URL` to point at it. No code change required.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_API_KEY` | — | **Required.** Ollama API key from [ollama.com/settings/keys](https://ollama.com/settings/keys) |
-| `OLLAMA_BASE_URL` | `https://ollama.com` | Base URL. Override with `http://localhost:11434` for self-hosted Ollama |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model. Other options: `mxbai-embed-large`, `embeddinggemma`, `qwen3-embedding:0.6b` |
-| `OLLAMA_EMBED_DIMENSIONS` | *(model default)* | Override embedding dimensions if the model supports it (e.g. `256`, `512`) |
-| `OLLAMA_PROXY_URL` | — | HTTP proxy URL |
-
-```sh
-export QMD_LLM_PROVIDER=ollama
-export OLLAMA_API_KEY=ollama_xxxxxxxxxxxx
-qmd embed
-qmd query "deployment process"
-```
-
-> **Note:** Search-only provider — `qmd query` falls back to the original query
-> for the lexical/vector/hyde expansion slots (no LLM-generated variations).
-> Use the structured `qmd query $'intent:... lex:... vec:... hyde:...'` form
-> when you need to control expansion manually.
-
-#### Self-hosted Ollama (zero-cost, fully offline)
-
-The same `QMD_LLM_PROVIDER=ollama` provider works against a self-hosted
-[Ollama](https://ollama.com/) instance. No API key, no Cloud quota, no data
-leaving your machine. Useful for air-gapped setups, free-tier workarounds,
-or simply keeping embeddings local.
-
-```sh
-# 1. Start Ollama (default port 11434)
-ollama serve
-
-# 2. Pull an embed model. nomic-embed-text is the QMD default, but any
-#    embedding-capable model works (bge-m3, mxbai-embed-large, etc.).
-ollama pull nomic-embed-text   # ~274MB
-
-# 3. Point QMD at the local instance
-export QMD_LLM_PROVIDER=ollama
-export OLLAMA_BASE_URL=http://localhost:11434
-export OLLAMA_API_KEY=ignored   # any non-empty string; not checked locally
-qmd embed
-qmd query "deployment process"
-```
-
-If the configured `OLLAMA_EMBED_MODEL` is not present locally, QMD will
-surface the upstream 404 from `/api/embed` ("model ... not found, try
-pulling it first") — run `ollama pull <model>` to fix.
 
 ## How It Works
 
