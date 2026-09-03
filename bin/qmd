@@ -53,7 +53,7 @@ if (process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1
 
 function hasBun() {
   try {
-    const res = spawnSync("bun", ["--version"], { stdio: "ignore", shell: process.platform === "win32" });
+    const res = spawnSync("bun", ["--version"], { stdio: "ignore", shell: false });
     return res.status === 0;
   } catch {
     return false;
