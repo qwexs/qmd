@@ -158,12 +158,17 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
+      // Cloud providers are selected by the singleton factory.  Do not replace
+      // them with a local LlamaCpp instance here: doing so made `qmd embed`
+      // silently use the local GGUF even with QMD_LLM_PROVIDER=gonka.
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
+      const llm = process.env.QMD_LLM_PROVIDER
+        ? getDefaultLlamaCpp()
+        : new LlamaCpp({
+            embedModel: modelsForLlm.embed,
+            generateModel: modelsForLlm.generate,
+            rerankModel: modelsForLlm.rerank,
+          });
       setDefaultLlamaCpp(llm);
       store.llm = llm;
     } catch {
