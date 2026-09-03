@@ -103,6 +103,21 @@ Ollama is search-only: embeddings via `/api/embed`, reranking via cosine
 similarity over those embeddings (no native `/api/rerank` in the Ollama API).
 Query expansion is skipped (no `generate` model), matching Jina's surface.
 
+**Gonka Broker:**
+
+```sh
+export QMD_LLM_PROVIDER=gonka
+export GONKA_API_KEY=gnk-prx-...
+
+# Optional: these are the defaults
+export GONKA_BASE_URL=https://proxy.gonkabroker.com/v1
+export GONKA_EMBED_MODEL=BAAI/bge-m3
+```
+
+Gonka Broker provides 1024-dimensional BGE-M3 embeddings. Its public catalog
+does not currently expose a reranker, so QMD uses cosine similarity over
+Gonka embeddings for the reranking phase.
+
 > Without `QMD_LLM_PROVIDER`, QMD downloads ~2GB of GGUF models on first run and uses them locally. Set the variable to skip local models entirely.
 >
 > See [Environment Variables](#environment-variables) for the full reference.
@@ -1151,15 +1166,15 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
-| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina`, `openai`, or `ollama`. When unset, QMD uses local GGUF models via node-llama-cpp |
+| `QMD_LLM_PROVIDER` | *(local GGUF)* | LLM backend: `jina`, `openai`, `ollama`, or `gonka`. When unset, QMD uses local GGUF models via node-llama-cpp |
 
 ### Cloud Providers (fork feature — no local GPU required)
 
-This fork adds three cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
+This fork adds cloud backends for users without a local GPU. The local GGUF path is the default; cloud providers are opt-in via `QMD_LLM_PROVIDER`.
 
 #### Install without native build (Ubuntu / Windows, cloud-only)
 
-`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`, or `=ollama`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
+`node-llama-cpp` is **not** in `dependencies` in this fork — `bun install` / `npm install` on a clean Ubuntu or Windows box does **not** attempt to compile the native binding. That means `QMD_LLM_PROVIDER=openai` (or `=jina`, `=ollama`, or `=gonka`) works out of the box on a machine without a C++ toolchain. If you later need the local GGUF backend, install the package explicitly:
 
 ```sh
 bun add node-llama-cpp   # or: npm install node-llama-cpp
@@ -1258,6 +1273,25 @@ qmd query "deployment process"
 If the configured `OLLAMA_EMBED_MODEL` is not present locally, QMD will
 surface the upstream 404 from `/api/embed` ("model ... not found, try
 pulling it first") — run `ollama pull <model>` to fix.
+
+#### Gonka Broker (`QMD_LLM_PROVIDER=gonka`)
+
+Use [Gonka Broker](https://docs.gonkabroker.com/guides/embeddings/) for
+OpenAI-compatible BGE-M3 embeddings. Query expansion is skipped. Since Gonka
+Broker does not currently publish a reranker model, QMD reranks with cosine
+similarity over BGE-M3 vectors.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GONKA_API_KEY` | — | **Required.** Gonka Broker API key |
+| `GONKA_BASE_URL` | `https://proxy.gonkabroker.com/v1` | API base URL |
+| `GONKA_EMBED_MODEL` | `BAAI/bge-m3` | Embedding model (1024 dimensions) |
+| `GONKA_PROXY_URL` | — | HTTP proxy URL |
+
+```sh
+export QMD_LLM_PROVIDER=gonka
+export GONKA_API_KEY=gnk-prx-xxxxxxxxxxxx
+```
 
 ## How It Works
 

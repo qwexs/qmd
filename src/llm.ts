@@ -44,6 +44,7 @@ async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
           "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
           "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
           "       QMD_LLM_PROVIDER=ollama  OLLAMA_API_KEY=***  qmd ...\n" +
+          "       QMD_LLM_PROVIDER=gonka   GONKA_API_KEY=***   qmd ...\n" +
           "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
           "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
           "       (requires a working C++ toolchain on your platform)"
@@ -116,9 +117,9 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  * Returns the raw query for cloud providers (Jina/OpenAI handle their own prompts).
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  // Cloud providers (Jina/OpenAI/Ollama) handle their own prompt formatting; pass raw text.
+  // Cloud providers handle their own prompt formatting; pass raw text.
   const provider = process.env.QMD_LLM_PROVIDER;
-  if (provider === 'jina' || provider === 'openai' || provider === 'ollama') return query;
+  if (provider === 'jina' || provider === 'openai' || provider === 'ollama' || provider === 'gonka') return query;
 
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
@@ -134,9 +135,9 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Returns the raw text for cloud providers (Jina/OpenAI handle their own prompts).
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  // Cloud providers (Jina/OpenAI/Ollama) handle their own prompt formatting; pass raw text.
+  // Cloud providers handle their own prompt formatting; pass raw text.
   const provider = process.env.QMD_LLM_PROVIDER;
-  if (provider === 'jina' || provider === 'openai' || provider === 'ollama') return text;
+  if (provider === 'jina' || provider === 'openai' || provider === 'ollama' || provider === 'gonka') return text;
 
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
@@ -2079,14 +2080,21 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  * constructor installs the darwin exit guard, so any code path that obtains
  * the singleton is protected.
  *
- * Fork extension: when QMD_LLM_PROVIDER is "jina", "openai", or "ollama", return a
- * cloud-backed LLM (JinaLLM / OpenAILLM / OllamaLLM) instead. All three implement
+ * Fork extension: when QMD_LLM_PROVIDER is "jina", "openai", "ollama", or "gonka", return a
+ * cloud-backed LLM (JinaLLM / OpenAILLM / OllamaLLM / GonkaLLM) instead. All implement
  * the same surface that store.ts needs (embed/embedBatch/expandQuery/rerank/...
  * embedModelName/tokenize). The "as unknown as LlamaCpp" cast is a type
  * bridge: the cloud classes expose the same public method shape that
  * store.ts calls, but they are not subclasses of LlamaCpp.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
+  if (process.env.QMD_LLM_PROVIDER === 'gonka') {
+    if (!defaultLlamaCpp) {
+      const { GonkaLLM } = loadGonkaLLM();
+      defaultLlamaCpp = new GonkaLLM() as unknown as LlamaCpp;
+    }
+    return defaultLlamaCpp;
+  }
   if (process.env.QMD_LLM_PROVIDER === 'jina') {
     if (!defaultLlamaCpp) {
       const { JinaLLM } = loadJinaLLM();
@@ -2125,6 +2133,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
         "       QMD_LLM_PROVIDER=openai  OPENAI_API_KEY=***  qmd ...\n" +
         "       QMD_LLM_PROVIDER=jina    JINA_API_KEY=***    qmd ...\n" +
         "       QMD_LLM_PROVIDER=ollama  OLLAMA_API_KEY=***  qmd ...\n" +
+        "       QMD_LLM_PROVIDER=gonka   GONKA_API_KEY=***   qmd ...\n" +
         "  2. Install node-llama-cpp explicitly for local GGUF models:\n" +
         "       bun add node-llama-cpp    # or: npm install node-llama-cpp\n" +
         "       (requires a working C++ toolchain on your platform)"
@@ -2149,6 +2158,9 @@ function loadOpenAILLM(): { OpenAILLM: _Ctor } {
 }
 function loadOllamaLLM(): { OllamaLLM: _Ctor } {
   return _require("./ollama-llm.js") as { OllamaLLM: _Ctor };
+}
+function loadGonkaLLM(): { GonkaLLM: _Ctor } {
+  return _require("./gonka-llm.js") as { GonkaLLM: _Ctor };
 }
 
 /**
