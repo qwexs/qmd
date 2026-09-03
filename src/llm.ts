@@ -2306,7 +2306,6 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 // Lazy, sync class loaders for the cloud backends. We use createRequire to
 // avoid a circular import (these files import types from llm.ts) and to
 // stay compatible with the package's "type": "module" ESM build.
-import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 type _Ctor = new () => LLM;
 function loadJinaLLM(): { JinaLLM: _Ctor } {
