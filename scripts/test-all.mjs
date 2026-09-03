@@ -22,7 +22,8 @@ function run(label, command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
-    shell: process.platform === "win32",
+    // Keep executable paths intact on Windows (notably C:\\Program Files\\nodejs).
+    shell: false,
     env: { ...process.env, ...darwinMetalEnv, ...(extraEnv ?? {}) },
     ...spawnOptions,
   });

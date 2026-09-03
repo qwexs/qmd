@@ -3151,15 +3151,13 @@ function parseCLI() {
 }
 
 function getSkillInstallDir(globalInstall: boolean): string {
-  return globalInstall
-    ? resolve(homedir(), ".agents", "skills", "qmd")
-    : resolve(getPwd(), ".agents", "skills", "qmd");
+  const baseDir = globalInstall ? homedir() : getPwd();
+  return pathResolve(baseDir, ".agents", "skills", "qmd");
 }
 
 function getClaudeSkillLinkPath(globalInstall: boolean): string {
-  return globalInstall
-    ? resolve(homedir(), ".claude", "skills", "qmd")
-    : resolve(getPwd(), ".claude", "skills", "qmd");
+  const baseDir = globalInstall ? homedir() : getPwd();
+  return pathResolve(baseDir, ".claude", "skills", "qmd");
 }
 
 function pathExists(path: string): boolean {
