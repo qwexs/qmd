@@ -3051,6 +3051,7 @@ function parseCLI() {
       glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
       // Embed options
       force: { type: "boolean", short: "f" },
+      "gonka-free-tier": { type: "boolean" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
@@ -3591,6 +3592,7 @@ function showHelp(): void {
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
+  console.log("    --gonka-free-tier          - Limit Gonka to 5 requests/minute and stop network retries after 429");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
@@ -4298,6 +4300,10 @@ if (isMain) {
   enableProductionMode();
 
   const cli = parseCLI();
+
+  if (cli.values["gonka-free-tier"]) {
+    process.env.GONKA_RATE_LIMIT_RPM = "5";
+  }
 
   if (cli.values.version) {
     showVersion();

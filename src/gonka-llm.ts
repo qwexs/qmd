@@ -9,6 +9,7 @@
  *   GONKA_API_KEY       - Required. Gonka Broker API key.
  *   GONKA_BASE_URL      - Optional. Defaults to https://proxy.gonkabroker.com/v1.
  *   GONKA_EMBED_MODEL   - Optional. Defaults to BAAI/bge-m3.
+ *   GONKA_RATE_LIMIT_RPM - Optional. Evenly space requests at this RPM.
  *   GONKA_PROXY_URL     - Optional. HTTP proxy URL.
  */
 
@@ -29,6 +30,26 @@ import type {
 const DEFAULT_BASE_URL = "https://proxy.gonkabroker.com/v1";
 const DEFAULT_EMBED_MODEL = "BAAI/bge-m3";
 const MAX_BATCH_SIZE = 100;
+
+class GonkaRateLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GonkaRateLimitError";
+  }
+}
+
+function parseRateLimitRpm(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === "") return null;
+  const rpm = Number(value);
+  if (!Number.isSafeInteger(rpm) || rpm < 1) {
+    throw new Error("GONKA_RATE_LIMIT_RPM must be a positive integer");
+  }
+  return rpm;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 type FetchFn = typeof globalThis.fetch;
 
@@ -60,6 +81,10 @@ export class GonkaLLM implements LLM {
   private baseUrl: string;
   private embedModel: string;
   private fetchFn: FetchFn | null = null;
+  private minRequestIntervalMs: number;
+  private nextRequestAt = 0;
+  private requestQueue: Promise<void> = Promise.resolve();
+  private providerRateLimited = false;
 
   constructor() {
     const apiKey = process.env.GONKA_API_KEY;
@@ -67,6 +92,8 @@ export class GonkaLLM implements LLM {
     this.apiKey = apiKey;
     this.baseUrl = (process.env.GONKA_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
     this.embedModel = process.env.GONKA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    const rateLimitRpm = parseRateLimitRpm(process.env.GONKA_RATE_LIMIT_RPM);
+    this.minRequestIntervalMs = rateLimitRpm === null ? 0 : Math.ceil(60_000 / rateLimitRpm);
   }
 
   private async getFetch(): Promise<FetchFn> {
@@ -75,20 +102,37 @@ export class GonkaLLM implements LLM {
   }
 
   private async request<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {
-    const fetch = await this.getFetch();
-    const resp = await fetch(`${this.baseUrl}${endpoint}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+    const queued = this.requestQueue.then(async () => {
+      if (this.providerRateLimited) {
+        throw new GonkaRateLimitError("Gonka returned 429 earlier in this process; further requests are blocked");
+      }
+
+      const waitMs = Math.max(0, this.nextRequestAt - Date.now());
+      if (waitMs > 0) await sleep(waitMs);
+      this.nextRequestAt = Date.now() + this.minRequestIntervalMs;
+
+      const fetch = await this.getFetch();
+      const resp = await fetch(`${this.baseUrl}${endpoint}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        if (resp.status === 429) {
+          this.providerRateLimited = true;
+          throw new GonkaRateLimitError(`Gonka API error 429: ${text}`);
+        }
+        throw new Error(`Gonka API error ${resp.status}: ${text}`);
+      }
+      return resp.json() as Promise<T>;
     });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      throw new Error(`Gonka API error ${resp.status}: ${text}`);
-    }
-    return resp.json() as Promise<T>;
+
+    this.requestQueue = queued.then(() => undefined, () => undefined);
+    return queued;
   }
 
   async embed(text: string, _options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
@@ -109,6 +153,10 @@ export class GonkaLLM implements LLM {
         const embedded = await this.embedTexts(batch);
         for (let j = 0; j < embedded.length; j++) results[i + j] = embedded[j] ?? null;
       } catch (error) {
+        if (error instanceof GonkaRateLimitError) {
+          console.error("Gonka rate limit reached; skipping fallback requests for this process");
+          return results;
+        }
         console.warn("Gonka batch embed failed, falling back to individual requests:", error);
         for (let j = 0; j < batch.length; j++) {
           try {

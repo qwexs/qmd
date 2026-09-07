@@ -239,6 +239,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("--no-gpu");
+    expect(stdout).toContain("--gonka-free-tier");
     expect(stdout).toContain("qmd skill show/install");
   });
 
