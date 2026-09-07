@@ -31,6 +31,11 @@ describe("GonkaLLM", () => {
     expect(() => new GonkaLLM()).toThrow("GONKA_API_KEY");
   });
 
+  it("rejects an invalid Gonka request rate limit", () => {
+    process.env.GONKA_RATE_LIMIT_RPM = "0";
+    expect(() => new GonkaLLM()).toThrow("GONKA_RATE_LIMIT_RPM");
+  });
+
   it("uses Gonka's OpenAI-compatible embeddings endpoint and default model", async () => {
     const originalFetch = globalThis.fetch;
     let calledUrl = "";
@@ -63,6 +68,47 @@ describe("GonkaLLM", () => {
         { file: "strong.md", text: "strong" },
       ]);
       expect(result.results.map((item) => item.file)).toEqual(["strong.md", "weak.md"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("evenly spaces Gonka requests when an RPM limit is configured", async () => {
+    const originalFetch = globalThis.fetch;
+    process.env.GONKA_RATE_LIMIT_RPM = "600";
+    const calledAt: number[] = [];
+    globalThis.fetch = mockFetch((_url, init) => {
+      calledAt.push(Date.now());
+      const input = JSON.parse(init.body as string).input as string[];
+      return { data: input.map((_text, index) => ({ embedding: [index], index })), model: "BAAI/bge-m3" };
+    }) as any;
+    try {
+      const llm = new GonkaLLM();
+      await Promise.all([llm.embed("first"), llm.embed("second")]);
+      expect(calledAt).toHaveLength(2);
+      expect(calledAt[1]! - calledAt[0]!).toBeGreaterThanOrEqual(95);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not amplify a provider 429 into fallback network requests", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = mock(() => {
+      calls++;
+      return Promise.resolve({
+        ok: false,
+        status: 429,
+        json: () => Promise.resolve({}),
+        text: () => Promise.resolve("rate limit exceeded"),
+      });
+    }) as any;
+    try {
+      const llm = new GonkaLLM();
+      expect(await llm.embedBatch(["first", "second"])).toEqual([null, null]);
+      expect(await llm.embed("third")).toBeNull();
+      expect(calls).toBe(1);
     } finally {
       globalThis.fetch = originalFetch;
     }
