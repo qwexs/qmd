@@ -19,6 +19,9 @@ function mockFetch(handler: (url: string, init: RequestInit) => unknown) {
 describe("GonkaLLM", () => {
   beforeEach(() => {
     process.env.GONKA_API_KEY = "test-key";
+    delete process.env.QMD_RERANK_PROVIDER;
+    delete process.env.GONKA_RATE_LIMIT_RPM;
+    delete process.env.JINA_PROXY_URL;
   });
 
   afterEach(() => {
@@ -90,6 +93,59 @@ describe("GonkaLLM", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("keeps embeddings on Gonka while using Jina's dedicated reranker", async () => {
+    process.env.QMD_RERANK_PROVIDER = "jina";
+    process.env.JINA_API_KEY = "test-jina-key";
+    process.env.JINA_RERANK_MODEL = "jina-reranker-v3.5";
+    const originalFetch = globalThis.fetch;
+    const requests: { url: string; body: any }[] = [];
+    globalThis.fetch = mockFetch((url, init) => {
+      const body = JSON.parse(init.body as string);
+      requests.push({ url, body });
+      if (url === "https://proxy.gonkabroker.com/v1/embeddings") {
+        return { data: [{ embedding: [1, 0], index: 0 }], model: "BAAI/bge-m3" };
+      }
+      expect(url).toBe("https://api.jina.ai/v1/rerank");
+      return { results: [{ index: 1, relevance_score: 0.9 }, { index: 0, relevance_score: 0.1 }], model: body.model };
+    }) as any;
+    try {
+      const llm = new GonkaLLM();
+      expect((await llm.embed("query"))?.model).toBe("BAAI/bge-m3");
+      const result = await llm.rerank("query", [{ file: "weak.md", text: "weak" }, { file: "strong.md", text: "strong" }]);
+      expect(result.results.map(r => r.file)).toEqual(["strong.md", "weak.md"]);
+      expect(requests).toHaveLength(2);
+      expect(requests[1]!.body).toEqual({ model: "jina-reranker-v3.5", query: "query", documents: ["weak", "strong"], top_n: 2 });
+      expect(llm.rerankModelName).toBe("jina:jina-reranker-v3.5");
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("does not require Jina credentials for embedding-only maintenance", async () => {
+    process.env.QMD_RERANK_PROVIDER = "jina";
+    delete process.env.JINA_API_KEY;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch(() => ({ data: [{ embedding: [1, 0], index: 0 }], model: "BAAI/bge-m3" })) as any;
+    try {
+      const llm = new GonkaLLM();
+      expect(await llm.embed("query")).not.toBeNull();
+      await expect(llm.rerank("query", [{ file: "doc", text: "doc" }])).rejects.toThrow("JINA_API_KEY");
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("surfaces Jina errors without falling back to Gonka reranking", async () => {
+    process.env.QMD_RERANK_PROVIDER = "jina";
+    process.env.JINA_API_KEY = "test-jina-key";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async (url: string) => {
+      expect(url).toBe("https://api.jina.ai/v1/rerank");
+      return { ok: false, status: 429, text: async () => "rate limit" };
+    }) as any;
+    try {
+      await expect(new GonkaLLM().rerank("query", [{ file: "doc", text: "doc" }])).rejects.toThrow("Jina API error 429");
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    } finally { globalThis.fetch = originalFetch; }
   });
 
   it("does not amplify a provider 429 into fallback network requests", async () => {

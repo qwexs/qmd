@@ -1151,6 +1151,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 | `GONKA_RATE_LIMIT_RPM` | unset | Evenly space Gonka API requests at the specified requests-per-minute limit. A provider `429` blocks further network retries for the process. `qmd embed --gonka-free-tier` sets this to `5`. |
+| `QMD_RERANK_PROVIDER` | `gonka` with Gonka embeddings | Set to `jina` alongside `QMD_LLM_PROVIDER=gonka` to keep embeddings on Gonka and use Jina's dedicated reranker. Requires `JINA_API_KEY` for queries, not embedding-only maintenance. Honors `JINA_RERANK_MODEL`; provider failures are surfaced without silently falling back to cosine scoring. No reindex is needed. |
 
 ## How It Works
 
