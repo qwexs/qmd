@@ -7,8 +7,8 @@
  * processes are recovered via PID identity checks (same spirit as mcp-pid.ts).
  */
 
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { isQmdMcpPid } from "./mcp-pid.js";
 
 export type EmbedLockHandle = {
@@ -18,7 +18,8 @@ export type EmbedLockHandle = {
 
 /** Lockfile path sibling to the index database. */
 export function embedLockPathForDb(dbPath: string): string {
-  return join(dirname(dbPath), ".qmd-embed.lock");
+  const canonical = existsSync(dbPath) ? realpathSync(dbPath) : resolve(dbPath);
+  return `${canonical}.embed.lock`;
 }
 
 function readLockPid(lockPath: string): number | null {
@@ -63,6 +64,12 @@ function createOwnedLock(lockPath: string): EmbedLockHandle {
  * qmd process already holds the lock.
  */
 export function tryAcquireEmbedLock(lockPath: string): EmbedLockHandle | null {
+  // Respect live locks left by an older CLI during an in-place upgrade.
+  const legacyPath = join(dirname(lockPath), '.qmd-embed.lock');
+  if (legacyPath !== lockPath) {
+    const legacyPid = readLockPid(legacyPath);
+    if (legacyPid !== null && isLiveEmbedLockHolder(legacyPid)) return null;
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       return createOwnedLock(lockPath);

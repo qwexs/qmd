@@ -11,6 +11,8 @@
  *   GONKA_EMBED_MODEL   - Optional. Defaults to BAAI/bge-m3.
  *   GONKA_RATE_LIMIT_RPM - Optional. Evenly space requests at this RPM.
  *   GONKA_PROXY_URL     - Optional. HTTP proxy URL.
+ *   QMD_RERANK_PROVIDER - Optional. "jina" uses Jina's dedicated reranker;
+ *                         unset/"gonka" retains embedding cosine similarity.
  */
 
 import type {
@@ -26,9 +28,13 @@ import type {
   RerankResult,
   RerankDocumentResult,
 } from "./llm.js";
+import { JinaLLM } from "./jina-llm.js";
 
 const DEFAULT_BASE_URL = "https://proxy.gonkabroker.com/v1";
 const DEFAULT_EMBED_MODEL = "BAAI/bge-m3";
+export function resolveGonkaEmbedModel(): string {
+  return process.env.GONKA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+}
 const MAX_BATCH_SIZE = 100;
 
 class GonkaRateLimitError extends Error {
@@ -85,15 +91,32 @@ export class GonkaLLM implements LLM {
   private nextRequestAt = 0;
   private requestQueue: Promise<void> = Promise.resolve();
   private providerRateLimited = false;
+  private rerankProvider: "gonka" | "jina";
+  private jinaReranker: JinaLLM | null = null;
 
   constructor() {
     const apiKey = process.env.GONKA_API_KEY;
     if (!apiKey) throw new Error("GONKA_API_KEY environment variable is required");
     this.apiKey = apiKey;
     this.baseUrl = (process.env.GONKA_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
-    this.embedModel = process.env.GONKA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.embedModel = resolveGonkaEmbedModel();
     const rateLimitRpm = parseRateLimitRpm(process.env.GONKA_RATE_LIMIT_RPM);
     this.minRequestIntervalMs = rateLimitRpm === null ? 0 : Math.ceil(60_000 / rateLimitRpm);
+    const rerankProvider = process.env.QMD_RERANK_PROVIDER || "gonka";
+    if (rerankProvider !== "gonka" && rerankProvider !== "jina") {
+      throw new Error("QMD_RERANK_PROVIDER must be gonka or jina when using Gonka embeddings");
+    }
+    this.rerankProvider = rerankProvider;
+  }
+
+  get embedModelName(): string {
+    return this.embedModel;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankProvider === "jina"
+      ? `jina:${process.env.JINA_RERANK_MODEL || "jina-reranker-v2-base-multilingual"}`
+      : this.embedModel;
   }
 
   private async getFetch(): Promise<FetchFn> {
@@ -187,8 +210,14 @@ export class GonkaLLM implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    _options: RerankOptions = {}
+    options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (this.rerankProvider === "jina") {
+      // Initialize only for reranking: embed/maintenance must not depend on
+      // a second provider's credentials. Never silently fall back on failure.
+      this.jinaReranker ??= new JinaLLM();
+      return this.jinaReranker.rerank(query, documents, options);
+    }
     const embeddings = await this.embedTexts([query, ...documents.map((document) => document.text)]);
     const queryEmbedding = embeddings[0]?.embedding;
     if (!queryEmbedding) throw new Error("Failed to embed query for reranking");
