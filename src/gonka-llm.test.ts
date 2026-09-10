@@ -34,6 +34,13 @@ describe("GonkaLLM", () => {
     expect(() => new GonkaLLM()).toThrow("GONKA_API_KEY");
   });
 
+  it("reports the configured embedding model for index provenance", () => {
+    delete process.env.GONKA_EMBED_MODEL;
+    expect(new GonkaLLM().embedModelName).toBe("BAAI/bge-m3");
+    process.env.GONKA_EMBED_MODEL = "example/embedding-model";
+    expect(new GonkaLLM().embedModelName).toBe("example/embedding-model");
+  });
+
   it("rejects an invalid Gonka request rate limit", () => {
     process.env.GONKA_RATE_LIMIT_RPM = "0";
     expect(() => new GonkaLLM()).toThrow("GONKA_RATE_LIMIT_RPM");

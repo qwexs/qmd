@@ -3,7 +3,7 @@
  */
 import { describe, test, expect } from "vitest";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, writeFileSync, unlinkSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,9 +21,27 @@ const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
 describe("embedLockPathForDb", () => {
-  test("places .qmd-embed.lock next to the index database", () => {
-    expect(embedLockPathForDb("/tmp/qmd-cache/index.sqlite")).toBe("/tmp/qmd-cache/.qmd-embed.lock");
-    expect(embedLockPathForDb("/var/lib/qmd/custom.sqlite")).toBe("/var/lib/qmd/.qmd-embed.lock");
+  test("scopes locks to each index database", () => {
+    expect(embedLockPathForDb("/tmp/qmd-cache/index.sqlite")).toBe("/tmp/qmd-cache/index.sqlite.embed.lock");
+    expect(embedLockPathForDb("/tmp/qmd-cache/custom.sqlite")).toBe("/tmp/qmd-cache/custom.sqlite.embed.lock");
+  });
+
+  test("symlink aliases share a lock while different indexes do not", async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qmd-lock-alias-'));
+    try {
+      const db = join(dir, 'index.sqlite');
+      writeFileSync(db, '');
+      symlinkSync(db, join(dir, 'alias.sqlite'));
+      expect(embedLockPathForDb(db)).toBe(embedLockPathForDb(join(dir, 'alias.sqlite')));
+      const first = tryAcquireEmbedLock(embedLockPathForDb(db))!;
+      const second = tryAcquireEmbedLock(embedLockPathForDb(join(dir, 'second.sqlite')))!;
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(tryAcquireEmbedLock(embedLockPathForDb(join(dir, 'alias.sqlite')))).toBeNull();
+      first.release(); second.release();
+      writeFileSync(join(dir, '.qmd-embed.lock'), String(process.pid));
+      expect(tryAcquireEmbedLock(embedLockPathForDb(db))).toBeNull();
+    } finally { await rm(dir, {recursive: true, force: true}); }
   });
 });
 

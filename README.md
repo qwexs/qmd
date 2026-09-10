@@ -661,6 +661,22 @@ qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
 ```
 
+For automated maintenance, `qmd embed --format json -c notes -c docs`
+embeds the union of the selected collections, deduplicating shared content
+hashes. Without `-c`, it operates on the whole selected index. The JSON output
+is one `qmd.embed.v1` object with `status`, `model`, `pendingBefore` and
+`pendingAfter`; successful no-op runs report `skippedReason: no-pending-documents`.
+A busy index reports `status: deferred` and `skippedReason: lock-busy` without
+claiming completion. Partial embedding failures preserve pending work and exit
+nonzero. `qmd capabilities --format json` advertises this maintenance contract.
+Locks are scoped to the canonical database path, including symlink aliases.
+
+Cloud embedding provenance uses the provider's configured model name, including
+`GONKA_EMBED_MODEL` (default `BAAI/bge-m3`), rather than a local GGUF model pin.
+Existing embeddings with incorrect model metadata are **not** automatically
+relabeled: an operator must establish their provenance before migrating metadata
+or re-embedding them.
+
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for

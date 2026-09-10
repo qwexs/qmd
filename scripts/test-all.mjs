@@ -34,6 +34,7 @@ function run(label, command, args, options = {}) {
 }
 
 run("TypeScript build typecheck", process.execPath, [join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.build.json", "--noEmit"]);
+run("Gonka embedding contract (Bun)", "bun", ["test", "--timeout", "30000", "src/gonka-llm.test.ts", "src/cli/embed-contract.test.ts"]);
 run("Vitest suite under Node", process.execPath, [join(root, "node_modules", "vitest", "vitest.mjs"), "run", "--reporter=verbose", "--testTimeout", "60000", "test/"], { env: { CI: "true" } });
 run("Bun test suite", "bun", ["test", "--timeout", "60000", "--preload", "./src/test-preload.ts", "test/"], { env: { CI: "true" } });
 run("Package smoke", process.execPath, ["scripts/package-smoke.mjs"]);

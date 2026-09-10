@@ -95,6 +95,7 @@ import {
   type OutputFormat,
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
+import { resolveGonkaEmbedModel } from "../gonka-llm.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -667,7 +668,7 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
+    console.log(`  Embedding:   ${hfLink(resolveEmbedModelForCli())}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
@@ -997,7 +998,7 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
   const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
   const orphanedVectors = countOrphanedVectors(db);
   closeDb();
@@ -2043,7 +2044,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -2139,6 +2140,8 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
 }
 
 export function resolveEmbedModelForCli(): string {
+  // Diagnostics and text indexing must not require provider credentials.
+  if (process.env.QMD_LLM_PROVIDER === "gonka") return resolveGonkaEmbedModel();
   return ensureModelsConfiguredForCli().embed;
 }
 
@@ -2165,40 +2168,46 @@ function resolveModelsForRuntime(): { embed: string; generate: string; rerank: s
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string | readonly string[]; maxDurationMs?: number; json?: boolean },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const json = batchOptions?.json === true;
+  const log = (...args: unknown[]) => { if (!json) console.log(...args); };
+  const report = (data: Record<string, unknown>) => {
+    if (json) console.log(JSON.stringify({ schema: "qmd.embed.v1", model, collections: batchOptions?.collection ?? null, ...data }));
+  };
 
   // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
   if (!embedLock) {
-    console.log(EMBED_LOCK_BUSY_MESSAGE);
+    log(EMBED_LOCK_BUSY_MESSAGE);
+    report({ status: "deferred", skippedReason: "lock-busy" });
     closeDb();
     return;
   }
 
   try {
     if (force) {
-      console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+      log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
     }
 
     // Check if there's work to do before starting
     const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
     if (hashesToEmbed === 0 && !force) {
-      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+      log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+      report({ status: "ok", skippedReason: "no-pending-documents", pendingBefore: 0, pendingAfter: 0, chunksEmbedded: 0, docsProcessed: 0, errors: 0 });
       closeDb();
       return;
     }
 
-    console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+    log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
     if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
       const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
       const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
-      console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+      log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
     }
-    cursor.hide();
-    progress.indeterminate();
+    if (!json) { cursor.hide(); progress.indeterminate(); }
 
     const startTime = Date.now();
 
@@ -2211,7 +2220,7 @@ async function vectorIndex(
       chunkStrategy: batchOptions?.chunkStrategy,
       maxDurationMs: batchOptions?.maxDurationMs,
       onProgress: (info) => {
-        if (info.totalBytes === 0) return;
+        if (json || info.totalBytes === 0) return;
         // Progress is measured by input bytes, not by chunks. The final chunk
         // count is discovered lazily batch-by-batch, so displaying
         // chunksEmbedded/totalChunks makes the percent look wrong when a few
@@ -2237,27 +2246,30 @@ async function vectorIndex(
       },
     });
 
-    progress.clear();
-    cursor.show();
+    if (!json) { progress.clear(); cursor.show(); }
 
     const totalTimeSec = result.durationMs / 1000;
 
     if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
-      console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+      log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
-      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+      log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
       if (result.errors > 0) {
-        console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+        log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
         for (const failure of (result.failures ?? []).slice(0, 8)) {
-          console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
+          log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
         }
         if ((result.failures?.length ?? 0) > 8) {
-          console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+          log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
         }
       }
     }
 
+    const pendingAfter = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
+    const complete = result.errors === 0 && pendingAfter === 0;
+    report({ status: complete ? "ok" : "partial", pendingBefore: hashesToEmbed, pendingAfter, ...result });
+    if (!complete) process.exitCode = 1;
     closeDb();
   } finally {
     embedLock.release();
@@ -2678,7 +2690,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
 
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
-function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false, throwOnMissing: boolean = false): string[] {
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {
     return getDefaultCollectionNames();
@@ -2689,6 +2701,7 @@ function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults
   for (const name of names) {
     const coll = getCollectionFromYaml(name);
     if (!coll) {
+      if (throwOnMissing) throw new Error(`Collection not found: ${name}`);
       console.error(`Collection not found: ${name}`);
       closeDb();
       process.exit(1);
@@ -4137,7 +4150,7 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = process.env.QMD_LLM_PROVIDER ? resolveEmbedModelForCli() : activeModels.embed;
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
@@ -4636,6 +4649,10 @@ if (isMain) {
       manageTrust(cli.args[0]);
       break;
 
+    case "capabilities":
+      console.log(JSON.stringify({ schema: "qmd.capabilities.v1", version: readPackageJson().version, embed: { multipleCollections: true, indexScopedLock: true, structuredOutput: true } }));
+      break;
+
     case "embed":
       try {
         await resolveLocalConfigTrust();
@@ -4646,17 +4663,21 @@ if (isMain) {
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
-        // embed operates on a single collection; only the first value is used.
-        const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
-        const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false, true);
+        const embedCollection = embedValidatedCollections.length ? embedValidatedCollections : undefined;
+        await vectorIndex(process.env.QMD_LLM_PROVIDER ? resolveEmbedModelForCli() : resolveModelsForRuntime().embed, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
           maxDurationMs: embedMaxDurationMs,
+          json: cli.opts.format === "json",
         });
+        // The normal CLI teardown explicitly exits with zero; preserve a
+        // partial embed's failure after vectorIndex has released its lock.
+        if (process.exitCode) process.exit(process.exitCode);
       } catch (error) {
+        if (cli.opts.format === "json") console.log(JSON.stringify({ schema: "qmd.embed.v1", status: "error", error: error instanceof Error ? error.message : String(error) }));
         exitWithError(error);
       }
       break;

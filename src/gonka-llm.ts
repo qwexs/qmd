@@ -32,6 +32,9 @@ import { JinaLLM } from "./jina-llm.js";
 
 const DEFAULT_BASE_URL = "https://proxy.gonkabroker.com/v1";
 const DEFAULT_EMBED_MODEL = "BAAI/bge-m3";
+export function resolveGonkaEmbedModel(): string {
+  return process.env.GONKA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+}
 const MAX_BATCH_SIZE = 100;
 
 class GonkaRateLimitError extends Error {
@@ -96,7 +99,7 @@ export class GonkaLLM implements LLM {
     if (!apiKey) throw new Error("GONKA_API_KEY environment variable is required");
     this.apiKey = apiKey;
     this.baseUrl = (process.env.GONKA_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
-    this.embedModel = process.env.GONKA_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.embedModel = resolveGonkaEmbedModel();
     const rateLimitRpm = parseRateLimitRpm(process.env.GONKA_RATE_LIMIT_RPM);
     this.minRequestIntervalMs = rateLimitRpm === null ? 0 : Math.ceil(60_000 / rateLimitRpm);
     const rerankProvider = process.env.QMD_RERANK_PROVIDER || "gonka";
@@ -104,6 +107,10 @@ export class GonkaLLM implements LLM {
       throw new Error("QMD_RERANK_PROVIDER must be gonka or jina when using Gonka embeddings");
     }
     this.rerankProvider = rerankProvider;
+  }
+
+  get embedModelName(): string {
+    return this.embedModel;
   }
 
   get rerankModelName(): string {

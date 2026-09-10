@@ -1755,10 +1755,10 @@ export type EmbedOptions = {
   force?: boolean;
   model?: string;
   /**
-   * Restrict embedding to documents in a single collection.
+   * Restrict embedding to documents in the selected collection(s).
    * When omitted, all pending documents across every collection are embedded.
    */
-  collection?: string;
+  collection?: string | readonly string[];
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
@@ -1882,8 +1882,14 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+function embeddingScope(collection?: string | readonly string[]): { sql: string; params: string[] } {
+  if (collection === undefined) return { sql: '', params: [] };
+  const params = [...new Set(typeof collection === 'string' ? [collection] : collection)];
+  return { sql: params.length ? `AND d.collection IN (${params.map(() => '?').join(',')})` : 'AND 0', params };
+}
+
+function getPendingEmbeddingDocs(db: Database, collection?: string | readonly string[], model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+  const scope = embeddingScope(collection);
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -1898,11 +1904,11 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
       ) v ON d.hash = v.hash
       WHERE d.active = 1
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-        ${collectionFilter}
+        ${scope.sql}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    return stmt.all(model, fingerprint, ...scope.params) as PendingEmbeddingDoc[];
   });
 }
 
@@ -2517,8 +2523,8 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+export function getHashesNeedingEmbedding(db: Database, collection?: string | readonly string[], model: string = DEFAULT_EMBED_MODEL): number {
+  const scope = embeddingScope(collection);
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -2532,9 +2538,9 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
       ) v ON d.hash = v.hash
       WHERE d.active = 1
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-        ${collectionFilter}
+        ${scope.sql}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = stmt.get(model, fingerprint, ...scope.params) as { count: number };
     return result.count;
   });
 }
@@ -4362,22 +4368,25 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  * clear empties content_vectors entirely, in which case it is dropped so the
  * next embed can recreate the table with the current dimensions.
  */
-export function clearAllEmbeddings(db: Database, collection?: string): void {
-  if (!collection) {
+export function clearAllEmbeddings(db: Database, collection?: string | readonly string[]): void {
+  if (collection === undefined) {
     db.exec(`DELETE FROM content_vectors`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
     return;
   }
 
+  const scope = embeddingScope(collection);
+  if (scope.params.length === 0) return;
+  const placeholders = scope.params.map(() => '?').join(',');
   const exclusiveHashesQuery = `
     SELECT DISTINCT d.hash
     FROM documents d
-    WHERE d.collection = ? AND d.active = 1
+    WHERE d.collection IN (${placeholders}) AND d.active = 1
       AND NOT EXISTS (
         SELECT 1 FROM documents d2
         WHERE d2.hash = d.hash
           AND d2.active = 1
-          AND d2.collection != d.collection
+          AND d2.collection NOT IN (${placeholders})
       )
   `;
 
@@ -4391,7 +4400,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
         SELECT cv.hash, cv.seq
         FROM content_vectors cv
         WHERE cv.hash IN (${exclusiveHashesQuery})
-      `).all(collection) as { hash: string; seq: number }[];
+      `).all(...scope.params, ...scope.params) as { hash: string; seq: number }[];
 
       const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
       for (const row of hashSeqRows) {
@@ -4402,7 +4411,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     db.prepare(`
       DELETE FROM content_vectors
       WHERE hash IN (${exclusiveHashesQuery})
-    `).run(collection);
+    `).run(...scope.params, ...scope.params);
 
     const remaining = db
       .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
